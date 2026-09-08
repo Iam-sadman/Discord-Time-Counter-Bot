@@ -1,0 +1,11 @@
+Bot name: Time Counter
+
+Service description. The Bot tracks how much time members spend in voice channels, split into three states (unmuted, muted, deafened). It provides statistics via slash commands (/stats, /leaderboard), manual CSV exports (/export), and an automated end-of-month CSV report, after which the current month's statistics are reset.
+Acceptable use. You agree to use the Bot in compliance with Discord's Terms of Service and Community Guidelines, applicable laws, and these Terms. No harassing or targeting other users, no attempts to disrupt the Bot, no circumventing privacy/permission settings.
+Availability. Best-effort basis; the operator may update, suspend, or discontinue the Bot at any time. No guarantee of uninterrupted service or that all voice time will be recorded (e.g., time while the Bot is offline is not tracked).
+Disclaimer of warranties. The Bot is provided "as is" and "as available", without warranties of any kind.
+Limitation of liability. To the maximum extent permitted by law, no liability for indirect, incidental, special, consequential, or punitive damages, or loss of data. Your sole remedy is to stop using the Bot and remove it.
+Data and privacy. The Bot processes data as described in the Privacy Policy, which forms part of these Terms.
+Termination. Remove the Bot to stop using it; statistics delete automatically at each month end; the operator may delete all stored data at any time.
+Changes. The operator may revise these Terms by posting an updated version; continued use constitutes acceptance.
+Contact. [email / support server]
