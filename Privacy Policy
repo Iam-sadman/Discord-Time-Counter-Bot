@@ -1,9 +1,0 @@
-Overview. The Bot tracks voice channel time and provides statistics. It does not read message content, does not track online presence, and processes nothing outside the servers it's added to.
-Data processed. Discord user IDs, guild IDs, voice state category (unmuted/muted/deafened), accumulated seconds per user per guild. Usernames/display names are resolved from Discord at export time and not stored. Configuration records (monthly report channel, last-report-month marker) are stored as small settings. No message content, reactions, DMs, IPs, or device info.
-Why. Solely to provide the core functionality: per-member stats, the monthly leaderboard, CSV exports, and the month-end report/reset.
-Where it's stored. A local SQLite database on the operator's server. Not sold, not shared with third parties. Data necessarily flows through Discord's systems as part of the Discord API, governed by Discord's own Terms/Privacy.
-Retention. Voice statistics reset automatically at the end of every calendar month; config records persist until changed; raw timestamps exist only in memory while a member is in voice; exports are delivered to the channel and not archived.
-Your rights. Admins can remove the bot to stop processing; members can contact the server admin or operator to request deletion of their stats.
-Minors. No targeting of under-13s; use subject to Discord's minimum-age rules.
-Security. Data access is limited to the server operator, who is responsible for securing the server and bot token.
-Changes. Policy may be updated; continued use constitutes acceptance.
