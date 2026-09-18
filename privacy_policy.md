@@ -1,0 +1,75 @@
+# Privacy Policy for Discord Voice Counter Bot
+
+**Last Updated:** September 18, 2026
+
+This Privacy Policy outlines how the **Discord Voice Counter Bot** ("Bot", "we", "us", or "our") collects, uses, stores, and protects user data when deployed in a Discord server.
+
+By inviting or using the Bot in your Discord server, you agree to the collection and use of information in accordance with this policy.
+
+## 1. Information We Collect
+
+To provide voice tracking and reporting functionality, the Bot collects minimal and specific data related to voice channel activity:
+
+### A. Data Collected Automatically
+
+* **Discord User ID**: Used as a unique identifier to associate voice duration metrics with your account.
+
+* **Display Name / Username**: Used to display human-readable names in generated CSV reports.
+
+* **Voice Channel ID & Channel Name**: Used to differentiate activity across different voice channels within a server.
+
+* **Voice State Durations**: Total accumulated time spent in **Unmuted**, **Muted**, and **Deafened** states while connected to voice channels.
+
+### B. What We DO NOT Collect
+
+* **Audio Recordings**: The Bot does **NOT** record, stream, process, or store any voice audio.
+
+* **Text Messages**: The Bot does **NOT** read, store, or log any text channel messages.
+
+* **Personal Information**: We do not collect emails, real names, IP addresses, or payment details.
+
+## 2. How We Use Collected Data
+
+The collected data is used strictly for the following operational purposes:
+
+* Aggregating total time spent by users in voice channels.
+
+* Generating automated CSV reports per server request or via scheduled monthly tasks.
+
+* Providing mid-month stats via the `/report` command.
+
+We do **NOT** sell, rent, trade, or share your data with third parties or advertising networks.
+
+## 3. Data Storage and Security
+
+* **Storage Location**: All data is stored locally in an isolated SQLite database (`voice_tracker.db`) on the host server/VPS where the Bot is deployed.
+
+* **Security**: Access to the host server is restricted to the bot owner/administrator.
+
+* **No Cloud Transmission**: Data is never sent to third-party databases or analytics services outside of sending the CSV report file directly back to your designated Discord server channel.
+
+## 4. Data Retention and Deletion
+
+We adhere to a strict minimal-retention schedule:
+
+* **Automated Monthly Reset**: All recorded statistics in the database are **automatically deleted** at **23:59** on the last day of every calendar month after the monthly report CSV is generated and sent.
+
+* **Manual Reset**: Server Administrators can wipe all stored data at any time using the `/resetdata` slash command.
+
+* **Right to Request Deletion**: Any user may request immediate removal of their stored metrics by contacting the Bot Administrator or server owner.
+
+## 5. Third-Party Services
+
+The Bot relies on the official **Discord API** to receive gateway events (such as voice status changes). Your use of Discord is governed by the [Discord Terms of Service](https://discord.com/terms?utm_source=gemini) and [Discord Privacy Policy](https://discord.com/privacy?utm_source=gemini).
+
+## 6. Children's Privacy
+
+The Bot complies with Discord's Terms of Service and does not knowingly collect personal data from anyone under the minimum age required by Discord (13 years of age, or higher depending on local laws).
+
+## 7. Changes to This Privacy Policy
+
+We may update this Privacy Policy from time to time. Any updates will be published in the Bot’s GitHub repository or shared within the server. Continued use of the Bot signifies acceptance of any modified policy terms.
+
+## 8. Contact Information
+
+If you have any questions, concerns, or requests regarding this Privacy Policy or your data, please contact the Bot developer via GitHub issues or directly on Discord.
