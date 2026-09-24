@@ -262,16 +262,20 @@ async def fetch_user_stats(user_id: int, time_filter: str):
         async with db.execute(query, params) as cursor:
             rows = await cursor.fetchall()
 
-    unmuted = sum(r[1] for r in rows) if rows else 0.0
-    muted = sum(r[2] for r in rows) if rows else 0.0
-    deafened = sum(r[3] for r in rows) if rows else 0.0
+    unmuted = sum((r[1] or 0.0) for r in rows) if rows else 0.0
+    muted = sum((r[2] or 0.0) for r in rows) if rows else 0.0
+    deafened = sum((r[3] or 0.0) for r in rows) if rows else 0.0
     total = unmuted + muted + deafened
 
     top_vc = "None"
     max_vc_time = 0.0
     channel_breakdown = []
     for r in rows:
-        vc_total = r[1] + r[2] + r[3]
+        vc_unmuted = r[1] or 0.0
+        vc_muted = r[2] or 0.0
+        vc_deafened = r[3] or 0.0
+        vc_total = vc_unmuted + vc_muted + vc_deafened
+
         if vc_total > 0:
             channel_breakdown.append((r[0], vc_total))
         if vc_total > max_vc_time:
@@ -718,6 +722,9 @@ async def stats_command(interaction: discord.Interaction, user: discord.Member =
             ephemeral=True,
         )
         return
+
+    # Defer interaction to allow graphic processing without timing out
+    await interaction.response.defer()
 
     target_member = user or interaction.user
     if target_member.id in active_sessions:
