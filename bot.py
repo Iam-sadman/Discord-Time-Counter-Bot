@@ -23,6 +23,7 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 REPORT_CHANNEL_ID = int(os.getenv("REPORT_CHANNEL_ID", 0))
 STATS_CHANNEL_ID = int(os.getenv("STATS_CHANNEL_ID", 0))
+AFK_CHANNEL_ID = int(os.getenv("AFK_CHANNEL_ID", 0))
 TZ_NAME = os.getenv("TIMEZONE", "Asia/Dhaka")
 LOCAL_TZ = ZoneInfo(TZ_NAME)
 
@@ -38,6 +39,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # In-memory tracking
 active_sessions = {}
+deafen_timestamps = {}       # {user_id: timestamp_deafened}
+afk_moved_timestamps = {}    # {user_id: timestamp_moved_to_afk}
 
 
 def get_current_month_str() -> str:
@@ -143,11 +146,10 @@ def format_duration(seconds: float) -> str:
 
 # ----------------- CHART GENERATION -----------------
 def generate_stats_chart_sync(stats: dict, channel_breakdown: list) -> io.BytesIO:
-    # Create a 2-subplot figure with Discord dark theme background
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4.5), gridspec_kw={'width_ratios': [1, 1.25]})
     fig.patch.set_facecolor("#2b2d31")  # Discord Dark Theme Background
 
-    # 1. DONUT CHART (Unmuted / Muted / Deafened)
+    # 1. DONUT CHART
     ax1.set_facecolor("#2b2d31")
     unmuted = stats["unmuted"]
     muted = stats["muted"]
@@ -156,7 +158,7 @@ def generate_stats_chart_sync(stats: dict, channel_breakdown: list) -> io.BytesI
 
     values = [unmuted, muted, deafened]
     labels = ["Unmuted", "Muted", "Deafened"]
-    colors = ["#57F287", "#FEE75C", "#ED4245"]  # Discord Green, Yellow, Red
+    colors = ["#57F287", "#FEE75C", "#ED4245"]  # Green, Yellow, Red
 
     filtered = [(v, l, c) for v, l, c in zip(values, labels, colors) if v > 0]
 
@@ -188,21 +190,18 @@ def generate_stats_chart_sync(stats: dict, channel_breakdown: list) -> io.BytesI
 
     ax1.set_title("State Breakdown", color="#ffffff", fontsize=12, fontweight="bold", pad=12)
 
-    # 2. HORIZONTAL BAR CHART (Voice Channel Breakdown)
+    # 2. HORIZONTAL BAR CHART
     ax2.set_facecolor("#2b2d31")
 
     if not channel_breakdown or total_sec <= 0:
         ax2.text(0.5, 0.5, "No Channel Data", ha="center", va="center", color="#8e9297", fontsize=12, transform=ax2.transAxes)
         ax2.axis('off')
     else:
-        # Show top 5 active voice channels
         top_channels = channel_breakdown[:5]
-        top_channels.reverse()  # Reverse for top-to-bottom bar display
+        top_channels.reverse()
 
         ch_names = [c[0] for c in top_channels]
         ch_times = [c[1] for c in top_channels]
-
-        # Truncate channel names if too long for layout
         ch_names_clean = [name[:14] + "…" if len(name) > 14 else name for name in ch_names]
 
         bars = ax2.barh(ch_names_clean, ch_times, color="#5865F2", height=0.55, edgecolor="none")
@@ -223,8 +222,6 @@ def generate_stats_chart_sync(stats: dict, channel_breakdown: list) -> io.BytesI
             )
 
         ax2.set_xlim(0, max_time * 1.38)
-
-        # Apply styling to bar chart
         ax2.tick_params(axis='y', colors='#dcddde', labelsize=10)
         ax2.tick_params(axis='x', colors='#8e9297', labelsize=8)
         ax2.spines['top'].set_visible(False)
@@ -281,7 +278,6 @@ async def fetch_user_stats(user_id: int, time_filter: str):
             max_vc_time = vc_total
             top_vc = r[0]
 
-    # Sort channels by most active duration
     channel_breakdown.sort(key=lambda x: x[1], reverse=True)
 
     return {
@@ -335,7 +331,6 @@ async def fetch_leaderboard_data(time_filter: str):
             if total <= 0:
                 continue
 
-            # Fetch primary channel for this user in the specified timeframe
             if month_str:
                 ch_query = """
                     SELECT channel_name, SUM(unmuted_seconds + muted_seconds + deafened_seconds) as ch_total
@@ -602,6 +597,8 @@ async def on_ready():
         periodic_sync.start()
     if not monthly_report_task.is_running():
         monthly_report_task.start()
+    if not check_afk_deafened_users.is_running():
+        check_afk_deafened_users.start()
 
 
 @bot.tree.error
@@ -626,6 +623,8 @@ async def on_voice_state_update(member, before, after):
 
     if after.channel is None:
         active_sessions.pop(member.id, None)
+        deafen_timestamps.pop(member.id, None)
+        afk_moved_timestamps.pop(member.id, None)
         return
 
     new_state = determine_state(after)
@@ -636,6 +635,11 @@ async def on_voice_state_update(member, before, after):
         "last_update": time.time(),
         "name": member.display_name,
     }
+
+    # Reset AFK tracking if user undeafens
+    if new_state != "deafened":
+        deafen_timestamps.pop(member.id, None)
+        afk_moved_timestamps.pop(member.id, None)
 
 
 # ----------------- BACKGROUND TASKS -----------------
@@ -656,6 +660,52 @@ async def monthly_report_task():
             await generate_and_send_csv(channel)
             await channel.send("📊 **Monthly CSV report generated. New tracking cycle started automatically!**")
             await asyncio.sleep(60)
+
+
+@tasks.loop(seconds=15)
+async def check_afk_deafened_users():
+    if not AFK_CHANNEL_ID:
+        return
+
+    now = time.time()
+    for guild in bot.guilds:
+        afk_channel = guild.get_channel(AFK_CHANNEL_ID)
+        if not afk_channel:
+            continue
+
+        for vc in guild.voice_channels:
+            for member in vc.members:
+                if member.bot or not member.voice:
+                    continue
+
+                is_deafened = member.voice.self_deaf or member.voice.deaf
+
+                if is_deafened:
+                    if vc.id != AFK_CHANNEL_ID:
+                        # Step 1: Check 5 minutes in standard VC
+                        if member.id not in deafen_timestamps:
+                            deafen_timestamps[member.id] = now
+                        elif (now - deafen_timestamps[member.id]) >= 300:  # 5 minutes
+                            try:
+                                await member.move_to(afk_channel, reason="Deafened in VC for 5+ minutes")
+                                afk_moved_timestamps[member.id] = now
+                                deafen_timestamps.pop(member.id, None)
+                            except Exception as e:
+                                print(f"Failed to move {member.display_name} to AFK channel: {e}")
+                    else:
+                        # Step 2: Check 5 minutes in AFK channel
+                        if member.id not in afk_moved_timestamps:
+                            afk_moved_timestamps[member.id] = now
+                        elif (now - afk_moved_timestamps[member.id]) >= 300:  # 5 minutes in AFK
+                            try:
+                                await member.move_to(None, reason="Inactive in AFK channel for 5+ minutes")
+                                afk_moved_timestamps.pop(member.id, None)
+                                deafen_timestamps.pop(member.id, None)
+                            except Exception as e:
+                                print(f"Failed to disconnect {member.display_name}: {e}")
+                else:
+                    deafen_timestamps.pop(member.id, None)
+                    afk_moved_timestamps.pop(member.id, None)
 
 
 # ----------------- SLASH COMMANDS -----------------
