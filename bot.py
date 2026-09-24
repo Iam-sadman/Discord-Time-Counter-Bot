@@ -373,7 +373,7 @@ async def fetch_leaderboard_data(time_filter: str):
     return leaderboard
 
 
-async def generate_and_send_csv(channel: discord.TextChannel):
+async def generate_and_send_csv(target):
     for user_id in list(active_sessions.keys()):
         await flush_user_session(user_id)
 
@@ -391,7 +391,11 @@ async def generate_and_send_csv(channel: discord.TextChannel):
             rows = await cursor.fetchall()
 
         if not rows:
-            await channel.send(f"ℹ️ No voice activity recorded for month `{curr_month}`.")
+            msg = f"ℹ️ `{curr_month}` মাসের জন্য কোনো ভয়েস অ্যাক্টিভিটি ডাটা রেকর্ড করা হয়নি।"
+            if isinstance(target, discord.Interaction):
+                await target.followup.send(msg)
+            elif target:
+                await target.send(msg)
             return
 
         output = io.StringIO()
@@ -416,10 +420,12 @@ async def generate_and_send_csv(channel: discord.TextChannel):
         file_name = f"Voice_Report_{now_local.strftime('%Y-%m')}.csv"
         discord_file = discord.File(fp=io.BytesIO(output.getvalue().encode("utf-8")), filename=file_name)
 
-        await channel.send(
-            content=f"📊 **Monthly Voice Activity Report** ({now_local.strftime('%B %Y')})",
-            file=discord_file,
-        )
+        content_msg = f"📊 **Monthly Voice Activity Report** ({now_local.strftime('%B %Y')})"
+
+        if isinstance(target, discord.Interaction):
+            await target.followup.send(content=content_msg, file=discord_file)
+        elif target:
+            await target.send(content=content_msg, file=discord_file)
 
 
 # ----------------- DASHBOARD VIEW & HELPERS -----------------
@@ -743,6 +749,8 @@ async def leaderboard_command(interaction: discord.Interaction):
         )
         return
 
+    await interaction.response.defer()
+
     for uid in list(active_sessions.keys()):
         await flush_user_session(uid)
 
@@ -761,8 +769,7 @@ async def manual_report(interaction: discord.Interaction):
         return
 
     await interaction.response.defer()
-    await generate_and_send_csv(interaction.channel)
-    await interaction.followup.send("📊 Report generated successfully!", ephemeral=True)
+    await generate_and_send_csv(interaction)
 
 
 @bot.tree.command(name="resetdata", description="Manually reset all recorded voice activity statistics.")
