@@ -376,7 +376,7 @@ async def generate_and_send_csv(target, timeframe_label: str = "last_month"):
             rows = await cursor.fetchall()
 
         if not rows:
-            msg = f"ℹ️ `{start_date}` থেকে `{end_date}` পর্যন্ত কোনো ভয়েস ডাটা নেই।"
+            msg = f"ℹ️ `{start_date}` theke `{end_date}` porjonto kono voice data nei."
             if isinstance(target, discord.Interaction):
                 await target.followup.send(msg)
             elif target:
@@ -515,18 +515,17 @@ async def render_dashboard(interaction: discord.Interaction, member: discord.Mem
     label = filter_labels.get(view.current_filter, "🔧 Custom Range")
     date_str = f"({view.start_date} to {view.end_date})" if view.start_date != view.end_date else f"({view.start_date})"
 
-    # Live Session Data Extractions
+    # Safe Live Session Data Extractions (Fixed NoneType Issue)
     session = active_sessions.get(member.id)
-    if session:
-        current_vc = session["channel_name"]
-        join_time_formatted = datetime.fromtimestamp(session["join_timestamp"], LOCAL_TZ).strftime("%I:%M %p")
+    if session and session.get("join_timestamp"):
+        current_vc = session.get("channel_name", "Not in Voice")
+        join_ts = session.get("join_timestamp")
+        join_time_formatted = datetime.fromtimestamp(join_ts, LOCAL_TZ).strftime("%I:%M %p") if join_ts else "N/A"
     else:
         current_vc = "Not in Voice"
         join_time_formatted = "N/A"
 
     last_vc = session.get("last_channel_name", "None") if session else "None"
-    if not session and member.id in active_sessions: # fallback check
-        pass
 
     embed = discord.Embed(
         title=f"🎙️ Voice Dashboard — {member.display_name}",
@@ -629,9 +628,30 @@ class VoiceBot(commands.Bot):
         monthly_report_task.start()
         afk_and_deafen_monitor.start()
         await self.tree.sync()
-        print(f"✅ Logged in as {self.user} & Slash commands synced.")
+        print(f"✅ Slash commands synced.")
 
 bot = VoiceBot()
+
+@bot.event
+async def on_ready():
+    print(f"✅ Logged in as {bot.user}")
+    now = time.time()
+    for guild in bot.guilds:
+        for member in guild.members:
+            if member.bot or not member.voice or not member.voice.channel:
+                continue
+            if member.id not in active_sessions:
+                state = determine_state(member.voice)
+                active_sessions[member.id] = {
+                    "channel_id": member.voice.channel.id,
+                    "channel_name": member.voice.channel.name,
+                    "last_channel_name": "None",
+                    "join_timestamp": now,
+                    "state": state,
+                    "last_update": now,
+                    "name": member.display_name,
+                }
+    print("✅ Existing voice sessions scanned and initialized.")
 
 @tasks.loop(seconds=60)
 async def periodic_sync():
@@ -690,28 +710,20 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     if member.id in active_sessions:
         await flush_user_session(member.id)
 
-    previous_channel_name = None
-
-    # Handle disconnect or channel switch
-    if before.channel:
-        previous_channel_name = before.channel.name
-
     # If user is still in a voice channel (either switched or joined)
     if after.channel:
         state = determine_state(after)
         
-        # Check if they were already tracked in memory to preserve join time & last channel
         if member.id in active_sessions:
             existing = active_sessions[member.id]
-            # If changing channels, old channel becomes last_channel_name
             if before.channel and before.channel.id != after.channel.id:
                 last_vc = before.channel.name
             else:
                 last_vc = existing.get("last_channel_name", "None")
             
-            join_ts = existing["join_timestamp"]
+            # Safe check for join_timestamp to prevent NoneType errors
+            join_ts = existing.get("join_timestamp") or now
         else:
-            # Fresh join from outside voice
             last_vc = "None"
             join_ts = now
 
@@ -725,11 +737,8 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             "name": member.display_name,
         }
     else:
-        # Left voice entirely -> preserve last connected channel name before clearing session
         if member.id in active_sessions:
             last_vc = active_sessions[member.id]["channel_name"]
-            # We store a brief temp state or keep it so when they check stats while disconnected they can see last VC, 
-            # but for active session we clear it. Let's keep a record for last disconnected VC if needed:
             active_sessions[member.id] = {
                 "channel_id": None,
                 "channel_name": None,
@@ -739,13 +748,6 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                 "last_update": now,
                 "name": member.display_name,
             }
-            # Or fully pop if they are out of voice and you prefer:
-            # active_sessions.pop(member.id, None)
-
-        if member.id in active_sessions and not active_sessions[member.id]["channel_id"]:
-            # If they are completely out, maybe keep last_channel_name in a separate dict if they want to view stats while offline? 
-            # Let's keep active_sessions updated or let it clean up after 1 min.
-            pass
 
     # Update Deafen tracking
     if after.channel and (after.self_deaf or after.deaf):
@@ -791,10 +793,10 @@ async def stats_command(interaction: discord.Interaction, user: discord.Member =
 
     if start_date or end_date:
         if start_date and not parsed_start:
-            await interaction.followup.send("❌ `start_date` is formatted incorrectly! (Example: 2026-09-01)", ephemeral=True)
+            await interaction.followup.send("❌ `start_date` format thik nei! (Example: 2026-09-01)", ephemeral=True)
             return
         if end_date and not parsed_end:
-            await interaction.followup.send("❌ `end_date` is formatted incorrectly! (Example: 2026-09-15)", ephemeral=True)
+            await interaction.followup.send("❌ `end_date` format thik nei! (Example: 2026-09-15)", ephemeral=True)
             return
         
         final_start = parsed_start or parsed_end
@@ -833,10 +835,10 @@ async def leaderboard_command(interaction: discord.Interaction, start_date: str 
 
     if start_date or end_date:
         if start_date and not parsed_start:
-            await interaction.followup.send("❌ `start_date` is formatted incorrectly! (Example: 2026-09-01)", ephemeral=True)
+            await interaction.followup.send("❌ `start_date` format thik nei! (Example: 2026-09-01)", ephemeral=True)
             return
         if end_date and not parsed_end:
-            await interaction.followup.send("❌ `end_date` is formatted incorrectly! (Example: 2026-09-15)", ephemeral=True)
+            await interaction.followup.send("❌ `end_date` format thik nei! (Example: 2026-09-15)", ephemeral=True)
             return
         
         final_start = parsed_start or parsed_end
@@ -868,7 +870,7 @@ async def report_command(interaction: discord.Interaction):
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     print(f"Command Error: {error}")
-    msg = f"❌ কমান্ডটি প্রসেস করতে একটি সমস্যা হয়েছে: `{error}`"
+    msg = f"❌ Command process korte somossa hoyeche: `{error}`"
     try:
         if interaction.response.is_done():
             await interaction.followup.send(msg, ephemeral=True)
