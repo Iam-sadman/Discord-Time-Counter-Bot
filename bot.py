@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 import asyncio
 import os
+import re
 from dotenv import load_dotenv
 
 # Load variables from .env file
@@ -28,26 +29,64 @@ DB_FILE = os.getenv("DB_FILE", "voice_stats.db")
 
 def get_env_id(key):
     val = os.getenv(key)
-    return int(val) if val and val.strip().isdigit() else None
-
-def get_env_id_list(key):
-    val = os.getenv(key, "")
     if not val:
-        return []
-    return [int(x.strip()) for x in val.split(",") if x.strip().isdigit()]
+        return None
+    clean = val.split("#")[0].strip()
+    digits = re.findall(r"\d+", clean)
+    return int(digits[0]) if digits else None
+
+def get_env_allowed_roles():
+    raw_val = (
+        os.getenv("ROLESTATS_ALLOWED_ROLES")
+        or os.getenv("ALLOWED_ROLE_IDS")
+        or os.getenv("ROLESTATS_ROLES")
+        or os.getenv("ALLOWED_ROLES")
+        or ""
+    )
+    if not raw_val:
+        return {"ids": set(), "names": set()}
+
+    # Strip inline comments (e.g. # comment)
+    clean_val = raw_val.split("#")[0].strip()
+    if not clean_val:
+        return {"ids": set(), "names": set()}
+
+    parts = [p.strip().strip("'\"") for p in clean_val.split(",") if p.strip()]
+
+    role_ids = set()
+    role_names = set()
+
+    for p in parts:
+        digits = re.findall(r"\d+", p)
+        # Discord snowflake IDs are >= 15 digits
+        if digits and len(digits[0]) >= 15:
+            role_ids.add(int(digits[0]))
+        else:
+            clean_name = p.lstrip("@").strip().lower()
+            if clean_name:
+                role_names.add(clean_name)
+
+    return {"ids": role_ids, "names": role_names}
 
 STATS_CHANNEL_ID = get_env_id("STATS_CHANNEL_ID")
 REPORT_CHANNEL_ID = get_env_id("REPORT_CHANNEL_ID")
 AFK_CHANNEL_ID = get_env_id("AFK_CHANNEL_ID")
-ROLESTATS_ALLOWED_ROLES = get_env_id_list("ROLESTATS_ALLOWED_ROLES")
+ROLESTATS_ALLOWED_ROLES = get_env_allowed_roles()
 
 def can_use_rolestats(member: discord.Member) -> bool:
+    if not isinstance(member, discord.Member):
+        return False
+    # 1. Administrator permission always has access
     if member.guild_permissions.administrator:
         return True
-    if ROLESTATS_ALLOWED_ROLES:
-        member_role_ids = {r.id for r in member.roles}
-        if any(r_id in member_role_ids for r_id in ROLESTATS_ALLOWED_ROLES):
-            return True
+    # 2. Check allowed roles by ID or by Name
+    allowed = ROLESTATS_ALLOWED_ROLES
+    if allowed["ids"] or allowed["names"]:
+        for r in member.roles:
+            if r.id in allowed["ids"]:
+                return True
+            if r.name.lower() in allowed["names"]:
+                return True
     return False
 
 tz_name = os.getenv("TIMEZONE", "Asia/Dhaka")
@@ -55,6 +94,7 @@ try:
     LOCAL_TZ = ZoneInfo(tz_name)
 except Exception:
     LOCAL_TZ = ZoneInfo("Asia/Dhaka")
+
 
 
 
@@ -986,7 +1026,11 @@ bot = VoiceBot()
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
+    allowed_ids = list(ROLESTATS_ALLOWED_ROLES['ids'])
+    allowed_names = list(ROLESTATS_ALLOWED_ROLES['names'])
+    print(f"ℹ️ /rolestats allowed roles: IDs={allowed_ids} | Names={allowed_names}")
     now = time.time()
+
     for guild in bot.guilds:
         for member in guild.members:
             if member.bot or not member.voice or not member.voice.channel:
@@ -1231,11 +1275,22 @@ async def rolestats_command(
     start_date: str = None,
     end_date: str = None
 ):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+    if not interaction.guild:
         await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
         return
 
-    if not can_use_rolestats(interaction.user):
+    member = interaction.user
+    if not isinstance(member, discord.Member):
+        member = interaction.guild.get_member(interaction.user.id)
+        if not member:
+            try:
+                member = await interaction.guild.fetch_member(interaction.user.id)
+            except Exception:
+                pass
+
+    if not member or not can_use_rolestats(member):
+        user_roles = [f"{r.name}({r.id})" for r in getattr(member, 'roles', [])]
+        print(f"⚠️ Permission denied for {interaction.user} (User Roles: {user_roles}). Configured: {ROLESTATS_ALLOWED_ROLES}")
         await interaction.response.send_message(
             "❌ You do not have permission to use this command! (Requires Administrator or an authorized role).",
             ephemeral=True
@@ -1243,6 +1298,7 @@ async def rolestats_command(
         return
 
     await interaction.response.defer()
+
 
 
     # Validate custom date inputs
