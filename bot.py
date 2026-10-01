@@ -30,15 +30,32 @@ def get_env_id(key):
     val = os.getenv(key)
     return int(val) if val and val.strip().isdigit() else None
 
+def get_env_id_list(key):
+    val = os.getenv(key, "")
+    if not val:
+        return []
+    return [int(x.strip()) for x in val.split(",") if x.strip().isdigit()]
+
 STATS_CHANNEL_ID = get_env_id("STATS_CHANNEL_ID")
 REPORT_CHANNEL_ID = get_env_id("REPORT_CHANNEL_ID")
 AFK_CHANNEL_ID = get_env_id("AFK_CHANNEL_ID")
+ROLESTATS_ALLOWED_ROLES = get_env_id_list("ROLESTATS_ALLOWED_ROLES")
+
+def can_use_rolestats(member: discord.Member) -> bool:
+    if member.guild_permissions.administrator:
+        return True
+    if ROLESTATS_ALLOWED_ROLES:
+        member_role_ids = {r.id for r in member.roles}
+        if any(r_id in member_role_ids for r_id in ROLESTATS_ALLOWED_ROLES):
+            return True
+    return False
 
 tz_name = os.getenv("TIMEZONE", "Asia/Dhaka")
 try:
     LOCAL_TZ = ZoneInfo(tz_name)
 except Exception:
     LOCAL_TZ = ZoneInfo("Asia/Dhaka")
+
 
 
 # ==========================================
@@ -781,10 +798,13 @@ class RoleStatsView(discord.ui.View):
         return embed
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message("❌ Only the administrator who requested this report can use these buttons.", ephemeral=True)
+        is_member = isinstance(interaction.user, discord.Member)
+        is_authorized = is_member and can_use_rolestats(interaction.user)
+        if interaction.user.id != self.author_id and not is_authorized:
+            await interaction.response.send_message("❌ You do not have permission to interact with this report.", ephemeral=True)
             return False
         return True
+
 
     async def on_active_click(self, interaction: discord.Interaction):
         self.current_filter = "active"
@@ -1205,18 +1225,25 @@ async def report_command(interaction: discord.Interaction):
     start_date="Start date - Format YYYY-MM-DD (e.g. 2026-09-01)",
     end_date="End date - Format YYYY-MM-DD (e.g. 2026-09-15)"
 )
-@app_commands.checks.has_permissions(administrator=True)
 async def rolestats_command(
     interaction: discord.Interaction,
     role: discord.Role,
     start_date: str = None,
     end_date: str = None
 ):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    if not can_use_rolestats(interaction.user):
+        await interaction.response.send_message(
+            "❌ You do not have permission to use this command! (Requires Administrator or an authorized role).",
+            ephemeral=True
+        )
+        return
+
     await interaction.response.defer()
 
-    if not interaction.guild:
-        await interaction.followup.send("❌ This command can only be used in a server.", ephemeral=True)
-        return
 
     # Validate custom date inputs
     if start_date or end_date:

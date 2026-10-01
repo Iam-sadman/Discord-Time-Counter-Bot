@@ -27,7 +27,7 @@ An asynchronous Discord bot built with `discord.py`, `aiosqlite`, and `matplotli
 | :--- | :--- | :--- | :--- |
 | `/stats [user]` | Public Stats Channel | Everyone | Displays an interactive voice dashboard and dual-chart graphic for yourself or a target member. |
 | `/leaderboard` | Public Stats Channel | Everyone | Displays the top 10 active voice members with timeframe filtering options. |
-| `/rolestats <role> [start_date] [end_date]` | Any / Admin Channel | Administrator | Evaluates active voice hours for members of a specific role between custom dates and attaches a detailed `.csv` report. |
+| `/rolestats <role> [start_date] [end_date]` | Any / Admin Channel | Administrator / Allowed Roles | Evaluates active voice hours for members of a specific role between custom dates and attaches a detailed `.csv` report. |
 | `/report` | Admin Channel / Public | Administrator | Manually generates and sends a current month `.csv` voice activity report. |
 | `/resetdata` | Admin Channel / Public | Administrator | Permanently clears all recorded voice activity statistics from the database. |
 
@@ -52,8 +52,10 @@ DISCORD_TOKEN=your_discord_bot_token_here
 REPORT_CHANNEL_ID=123456789012345678   # Private Admin Channel ID for reports
 STATS_CHANNEL_ID=987654321098765432    # Public Text Channel ID for /stats and /leaderboard
 AFK_CHANNEL_ID=111222333444555666      # Optional: AFK channel ID for auto-move features
+ROLESTATS_ALLOWED_ROLES=111222333444,555666777888  # Optional: Comma-separated Role IDs allowed to run /rolestats
 TIMEZONE=Asia/Dhaka
 ```
+
 
 ---
 
