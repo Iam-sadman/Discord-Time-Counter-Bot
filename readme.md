@@ -15,6 +15,7 @@ An asynchronous Discord bot built with `discord.py`, `aiosqlite`, and `matplotli
 * 🔒 **Channel & Admin Security**:
   * `/stats` and `/leaderboard` can be restricted to a dedicated public stats channel (`STATS_CHANNEL_ID`).
   * `/report` and `/resetdata` are secured with administrator permissions.
+* 👥 **Role Activity Tracking (`/rolestats`)**: Inspects voice activity for any specific role (e.g., `@labelers`) across custom date ranges, delivering a ranked summary embed with a full `.csv` export attached.
 * 📁 **Automated CSV Reports**: Automatically generates monthly CSV reports and sends them to your designated channel.
 * 💾 **Persistent SQLite Storage**: Organizes metrics efficiently with fast indexing.
 
@@ -26,6 +27,7 @@ An asynchronous Discord bot built with `discord.py`, `aiosqlite`, and `matplotli
 | :--- | :--- | :--- | :--- |
 | `/stats [user]` | Public Stats Channel | Everyone | Displays an interactive voice dashboard and dual-chart graphic for yourself or a target member. |
 | `/leaderboard` | Public Stats Channel | Everyone | Displays the top 10 active voice members with timeframe filtering options. |
+| `/rolestats <role> [start_date] [end_date]` | Any / Admin Channel | Administrator | Evaluates active voice hours for members of a specific role between custom dates and attaches a detailed `.csv` report. |
 | `/report` | Admin Channel / Public | Administrator | Manually generates and sends a current month `.csv` voice activity report. |
 | `/resetdata` | Admin Channel / Public | Administrator | Permanently clears all recorded voice activity statistics from the database. |
 

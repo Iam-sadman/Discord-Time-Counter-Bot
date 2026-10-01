@@ -34,7 +34,12 @@ STATS_CHANNEL_ID = get_env_id("STATS_CHANNEL_ID")
 REPORT_CHANNEL_ID = get_env_id("REPORT_CHANNEL_ID")
 AFK_CHANNEL_ID = get_env_id("AFK_CHANNEL_ID")
 
-LOCAL_TZ = ZoneInfo("Asia/Dhaka")
+tz_name = os.getenv("TIMEZONE", "Asia/Dhaka")
+try:
+    LOCAL_TZ = ZoneInfo(tz_name)
+except Exception:
+    LOCAL_TZ = ZoneInfo("Asia/Dhaka")
+
 
 # ==========================================
 # IN-MEMORY TRACKING
@@ -410,6 +415,126 @@ async def generate_and_send_csv(target, timeframe_label: str = "last_month"):
         elif target:
             await target.send(content=content_msg, file=discord_file)
 
+async def fetch_role_activity_data(guild: discord.Guild, role: discord.Role, start_date: str, end_date: str):
+    await sync_all_sessions()
+
+    # Filter out bots
+    role_members = [m for m in role.members if not m.bot]
+    if not role_members:
+        return None
+
+    member_id_map = {m.id: m.display_name for m in role_members}
+    member_ids = list(member_id_map.keys())
+
+    user_stats = {
+        uid: {
+            "user_id": uid,
+            "name": member_id_map[uid],
+            "unmuted": 0.0,
+            "muted": 0.0,
+            "deafened": 0.0,
+            "total": 0.0,
+            "channels": {},
+        }
+        for uid in member_ids
+    }
+
+    chunk_size = 900
+    all_rows = []
+    async with aiosqlite.connect(DB_FILE) as db:
+        for i in range(0, len(member_ids), chunk_size):
+            chunk = member_ids[i:i + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            query = f"""
+                SELECT user_id, user_name, channel_name,
+                       SUM(unmuted_seconds), SUM(muted_seconds), SUM(deafened_seconds)
+                FROM voice_activity
+                WHERE user_id IN ({placeholders}) AND record_date BETWEEN ? AND ?
+                GROUP BY user_id, channel_name
+                ORDER BY user_name, channel_name
+            """
+            params = chunk + [start_date, end_date]
+            async with db.execute(query, params) as cursor:
+                all_rows.extend(await cursor.fetchall())
+
+    for row in all_rows:
+        uid, uname, cname, unmuted_sec, muted_sec, deaf_sec = row
+        unmuted_sec = unmuted_sec or 0.0
+        muted_sec = muted_sec or 0.0
+        deaf_sec = deaf_sec or 0.0
+        ch_total = unmuted_sec + muted_sec + deaf_sec
+
+        if uid in user_stats:
+            if uname:
+                user_stats[uid]["name"] = uname
+            user_stats[uid]["unmuted"] += unmuted_sec
+            user_stats[uid]["muted"] += muted_sec
+            user_stats[uid]["deafened"] += deaf_sec
+            user_stats[uid]["total"] += ch_total
+            user_stats[uid]["channels"][cname] = {
+                "unmuted": unmuted_sec,
+                "muted": muted_sec,
+                "deafened": deaf_sec,
+                "total": ch_total,
+            }
+
+    total_unmuted = sum(u["unmuted"] for u in user_stats.values())
+    total_muted = sum(u["muted"] for u in user_stats.values())
+    total_deafened = sum(u["deafened"] for u in user_stats.values())
+    total_time = total_unmuted + total_muted + total_deafened
+
+    sorted_users = sorted(user_stats.values(), key=lambda x: x["total"], reverse=True)
+    active_users = [u for u in sorted_users if u["total"] > 0]
+    inactive_users = [u for u in sorted_users if u["total"] == 0]
+
+    return {
+        "role": role,
+        "total_members": len(role_members),
+        "active_users": active_users,
+        "inactive_users": inactive_users,
+        "total_time": total_time,
+        "total_unmuted": total_unmuted,
+        "total_muted": total_muted,
+        "total_deafened": total_deafened,
+        "all_users_sorted": sorted_users,
+    }
+
+def generate_role_csv(data: dict, start_date: str, end_date: str) -> discord.File:
+    role = data["role"]
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    writer.writerow([
+        "User Name", "User ID", "Role", "Voice Channel",
+        "Unmuted Time", "Muted Time", "Deafened Time", "Total Time",
+        "Unmuted (Sec)", "Muted (Sec)", "Deafened (Sec)", "Total (Sec)"
+    ])
+
+    for u in data["active_users"]:
+        uname = u["name"]
+        uid = u["user_id"]
+        for cname, ch_data in u["channels"].items():
+            writer.writerow([
+                uname, uid, role.name, cname,
+                format_duration(ch_data["unmuted"]), format_duration(ch_data["muted"]),
+                format_duration(ch_data["deafened"]), format_duration(ch_data["total"]),
+                round(ch_data["unmuted"], 2), round(ch_data["muted"], 2),
+                round(ch_data["deafened"], 2), round(ch_data["total"], 2)
+            ])
+
+    for u in data["inactive_users"]:
+        writer.writerow([
+            u["name"], u["user_id"], role.name, "None (Inactive)",
+            "0s", "0s", "0s", "0s",
+            0, 0, 0, 0
+        ])
+
+    output.seek(0)
+    clean_role_name = "".join(c for c in role.name if c.isalnum() or c in (" ", "_", "-")).strip().replace(" ", "_")
+    filename = f"Role_{clean_role_name}_{start_date}_to_{end_date}.csv"
+    return discord.File(fp=io.BytesIO(output.getvalue().encode("utf-8")), filename=filename)
+
+
 # ==========================================
 # INTERACTIVE UI CLASSES (VIEWS)
 # ==========================================
@@ -494,6 +619,212 @@ class LeaderboardView(discord.ui.View):
         await sync_all_sessions()
         await interaction.response.defer()
         await render_leaderboard(interaction, self)
+
+
+class RoleStatsView(discord.ui.View):
+    def __init__(self, data: dict, start_date: str, end_date: str, author_id: int):
+        super().__init__(timeout=300)
+        self.data = data
+        self.start_date = start_date
+        self.end_date = end_date
+        self.author_id = author_id
+        self.current_filter = "active" if self.data["active_users"] else "all"
+        self.current_page = 0
+        self.items_per_page = 10
+        self.message = None
+
+        # Row 0: Filter Buttons
+        self.btn_active = discord.ui.Button(emoji="🟢", row=0)
+        self.btn_active.callback = self.on_active_click
+        self.add_item(self.btn_active)
+
+        self.btn_inactive = discord.ui.Button(emoji="⚪", row=0)
+        self.btn_inactive.callback = self.on_inactive_click
+        self.add_item(self.btn_inactive)
+
+        self.btn_all = discord.ui.Button(emoji="👥", row=0)
+        self.btn_all.callback = self.on_all_click
+        self.add_item(self.btn_all)
+
+        # Row 1: Pagination Buttons
+        self.btn_prev = discord.ui.Button(label="Prev", style=discord.ButtonStyle.primary, emoji="◀", row=1)
+        self.btn_prev.callback = self.on_prev_click
+        self.add_item(self.btn_prev)
+
+        self.btn_page = discord.ui.Button(style=discord.ButtonStyle.secondary, disabled=True, row=1)
+        self.add_item(self.btn_page)
+
+        self.btn_next = discord.ui.Button(label="Next", style=discord.ButtonStyle.primary, emoji="▶", row=1)
+        self.btn_next.callback = self.on_next_click
+        self.add_item(self.btn_next)
+
+        self.update_button_states()
+
+    def get_filtered_list(self):
+        if self.current_filter == "active":
+            return self.data["active_users"]
+        elif self.current_filter == "inactive":
+            return self.data["inactive_users"]
+        else:
+            return self.data["all_users_sorted"]
+
+    def get_total_pages(self):
+        items = self.get_filtered_list()
+        if not items:
+            return 1
+        return max(1, (len(items) + self.items_per_page - 1) // self.items_per_page)
+
+    def update_button_states(self):
+        total_pages = self.get_total_pages()
+        self.current_page = max(0, min(self.current_page, total_pages - 1))
+
+        # Filter buttons styles & labels
+        self.btn_active.style = discord.ButtonStyle.success if self.current_filter == "active" else discord.ButtonStyle.secondary
+        self.btn_inactive.style = discord.ButtonStyle.danger if self.current_filter == "inactive" else discord.ButtonStyle.secondary
+        self.btn_all.style = discord.ButtonStyle.primary if self.current_filter == "all" else discord.ButtonStyle.secondary
+
+        self.btn_active.label = f"Active ({len(self.data['active_users'])})"
+        self.btn_inactive.label = f"Inactive ({len(self.data['inactive_users'])})"
+        self.btn_all.label = f"All ({self.data['total_members']})"
+
+        # Pagination buttons
+        self.btn_prev.disabled = (self.current_page == 0)
+        self.btn_next.disabled = (self.current_page >= total_pages - 1)
+        self.btn_page.label = f"Page {self.current_page + 1}/{total_pages}"
+
+    def build_embed(self) -> discord.Embed:
+        role = self.data["role"]
+        total_pages = self.get_total_pages()
+        items = self.get_filtered_list()
+
+        embed = discord.Embed(
+            title=f"📊 Role Activity Report — @{role.name}",
+            color=role.color if role.color.value != 0 else discord.Color.blue(),
+        )
+
+        divider = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        embed.description = (
+            f"**Date Range:** `{self.start_date}` to `{self.end_date}`\n"
+            f"{divider}"
+        )
+
+        # Overview Fields
+        embed.add_field(
+            name="👥 Role Members",
+            value=f"• Total: `{self.data['total_members']}`\n• Active: `{len(self.data['active_users'])}`\n• Inactive: `{len(self.data['inactive_users'])}`",
+            inline=True,
+        )
+        embed.add_field(
+            name="⏱️ Total Voice Time",
+            value=f"**`{format_duration(self.data['total_time'])}`**",
+            inline=True,
+        )
+        embed.add_field(
+            name="🎧 Audio Breakdown",
+            value=(
+                f"🟢 **Unmuted:** `{format_duration(self.data['total_unmuted'])}`\n"
+                f"🟡 **Muted:** `{format_duration(self.data['total_muted'])}`\n"
+                f"🔴 **Deafened:** `{format_duration(self.data['total_deafened'])}`"
+            ),
+            inline=True,
+        )
+
+        embed.add_field(name="\u200b", value=divider, inline=False)
+
+        filter_titles = {
+            "active": "🟢 Active Members",
+            "inactive": "⚪ Inactive Members",
+            "all": "👥 All Role Members",
+        }
+        title_prefix = filter_titles.get(self.current_filter, "Members")
+
+        start_idx = self.current_page * self.items_per_page
+        end_idx = start_idx + self.items_per_page
+        page_items = items[start_idx:end_idx]
+
+        if not page_items:
+            embed.add_field(
+                name=f"{title_prefix} (0)",
+                value="*No members found in this category for this period.*",
+                inline=False,
+            )
+        else:
+            lines = []
+            medals = ["🥇", "🥈", "🥉"]
+            for idx_offset, u in enumerate(page_items):
+                overall_idx = start_idx + idx_offset + 1
+                u_name = u["name"]
+
+                if u["total"] > 0:
+                    rank_str = medals[overall_idx - 1] if overall_idx <= 3 and self.current_filter != "inactive" else f"`#{overall_idx}`"
+                    tot = format_duration(u["total"])
+                    unm = format_duration(u["unmuted"])
+                    mut = format_duration(u["muted"])
+                    deaf = format_duration(u["deafened"])
+                    lines.append(
+                        f"{rank_str} **{u_name}** — `{tot}`\n"
+                        f"└ 🟢 `{unm}` | 🟡 `{mut}` | 🔴 `{deaf}`"
+                    )
+                else:
+                    lines.append(f"`#{overall_idx}` **{u_name}** — `0s (Inactive)`")
+
+            range_text = f"Showing {start_idx + 1}–{min(end_idx, len(items))} of {len(items)}"
+            embed.add_field(
+                name=f"{title_prefix} ({range_text})",
+                value="\n".join(lines),
+                inline=False,
+            )
+
+        embed.set_footer(
+            text=f"Page {self.current_page + 1}/{total_pages} • Complete details in attached CSV"
+        )
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ Only the administrator who requested this report can use these buttons.", ephemeral=True)
+            return False
+        return True
+
+    async def on_active_click(self, interaction: discord.Interaction):
+        self.current_filter = "active"
+        self.current_page = 0
+        self.update_button_states()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def on_inactive_click(self, interaction: discord.Interaction):
+        self.current_filter = "inactive"
+        self.current_page = 0
+        self.update_button_states()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def on_all_click(self, interaction: discord.Interaction):
+        self.current_filter = "all"
+        self.current_page = 0
+        self.update_button_states()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def on_prev_click(self, interaction: discord.Interaction):
+        if self.current_page > 0:
+            self.current_page -= 1
+        self.update_button_states()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def on_next_click(self, interaction: discord.Interaction):
+        if self.current_page < self.get_total_pages() - 1:
+            self.current_page += 1
+        self.update_button_states()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def on_timeout(self):
+        try:
+            for child in self.children:
+                child.disabled = True
+            if self.message:
+                await self.message.edit(view=self)
+        except Exception:
+            pass
+
 
 # ==========================================
 # RENDER LOGIC HELPERS (CLEAN UI & SPACING)
@@ -867,10 +1198,66 @@ async def report_command(interaction: discord.Interaction):
     await interaction.response.defer()
     await generate_and_send_csv(interaction, "this_month")
 
+
+@bot.tree.command(name="rolestats", description="Check voice activity and generate a CSV report for members of a specific role.")
+@app_commands.describe(
+    role="Select the role to check activity for (e.g. @labelers)",
+    start_date="Start date - Format YYYY-MM-DD (e.g. 2026-09-01)",
+    end_date="End date - Format YYYY-MM-DD (e.g. 2026-09-15)"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def rolestats_command(
+    interaction: discord.Interaction,
+    role: discord.Role,
+    start_date: str = None,
+    end_date: str = None
+):
+    await interaction.response.defer()
+
+    if not interaction.guild:
+        await interaction.followup.send("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    # Validate custom date inputs
+    if start_date or end_date:
+        parsed_start = parse_custom_date(start_date) if start_date else None
+        parsed_end = parse_custom_date(end_date) if end_date else None
+
+        if start_date and not parsed_start:
+            await interaction.followup.send("❌ Invalid `start_date`! Format must be YYYY-MM-DD (e.g. 2026-09-01).", ephemeral=True)
+            return
+        if end_date and not parsed_end:
+            await interaction.followup.send("❌ Invalid `end_date`! Format must be YYYY-MM-DD (e.g. 2026-09-15).", ephemeral=True)
+            return
+
+        final_start = parsed_start or parsed_end
+        final_end = parsed_end or parsed_start
+
+        if final_start > final_end:
+            final_start, final_end = final_end, final_start
+    else:
+        final_start, final_end = get_date_range("this_month")
+
+    data = await fetch_role_activity_data(interaction.guild, role, final_start, final_end)
+    if not data or data["total_members"] == 0:
+        await interaction.followup.send(f"❌ No non-bot members found with the role {role.mention}.", ephemeral=True)
+        return
+
+    view = RoleStatsView(data, final_start, final_end, interaction.user.id)
+    embed = view.build_embed()
+    csv_file = generate_role_csv(data, final_start, final_end)
+    msg = await interaction.followup.send(embed=embed, file=csv_file, view=view)
+    view.message = msg
+
+
+
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    print(f"Command Error: {error}")
-    msg = f"❌ Command process korte somossa hoyeche: `{error}`"
+    if isinstance(error, app_commands.MissingPermissions):
+        msg = "❌ You need Administrator permissions to use this command."
+    else:
+        print(f"Command Error: {error}")
+        msg = f"❌ Command process korte somossa hoyeche: `{error}`"
     try:
         if interaction.response.is_done():
             await interaction.followup.send(msg, ephemeral=True)
