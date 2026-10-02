@@ -102,6 +102,7 @@ except Exception:
 # IN-MEMORY TRACKING
 # ==========================================
 active_sessions = {}
+last_connected_channels = {} # {user_id: last_channel_name}
 deafen_timestamps = {}       # {user_id: timestamp_deafened}
 afk_moved_timestamps = {}    # {user_id: timestamp_moved_to_afk}
 
@@ -208,6 +209,7 @@ async def init_db():
                 )
             """)
             
+        await db.execute("DELETE FROM voice_activity WHERE channel_id IS NULL OR channel_name IS NULL")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_user_date ON voice_activity(user_id, record_date)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_date ON voice_activity(record_date)")
         await db.commit()
@@ -217,6 +219,9 @@ async def flush_user_session(user_id: int):
         return
 
     session = active_sessions[user_id]
+    if not session.get("channel_id") or not session.get("channel_name"):
+        return
+
     now = time.time()
     elapsed = now - session["last_update"]
     session["last_update"] = now
@@ -252,6 +257,9 @@ async def sync_all_sessions():
     record_date = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
 
     for user_id, session in active_sessions.items():
+        if not session.get("channel_id") or not session.get("channel_name"):
+            continue
+
         elapsed = now - session["last_update"]
         if elapsed <= 0:
             continue
@@ -288,7 +296,7 @@ async def fetch_user_stats(user_id: int, start_date: str, end_date: str):
     query = """
         SELECT channel_name, SUM(unmuted_seconds), SUM(muted_seconds), SUM(deafened_seconds)
         FROM voice_activity
-        WHERE user_id = ? AND record_date BETWEEN ? AND ?
+        WHERE user_id = ? AND record_date BETWEEN ? AND ? AND channel_name IS NOT NULL
         GROUP BY channel_name
     """
     params = [user_id, start_date, end_date]
@@ -307,16 +315,20 @@ async def fetch_user_stats(user_id: int, start_date: str, end_date: str):
     channel_breakdown = []
     
     for r in rows:
+        ch_name = r[0]
+        if not ch_name:
+            continue
+
         vc_unmuted = r[1] or 0.0
         vc_muted = r[2] or 0.0
         vc_deafened = r[3] or 0.0
         vc_total = vc_unmuted + vc_muted + vc_deafened
 
         if vc_total > 0:
-            channel_breakdown.append((r[0], vc_total))
+            channel_breakdown.append((ch_name, vc_total))
         if vc_total > max_vc_time:
             max_vc_time = vc_total
-            top_vc = r[0]
+            top_vc = ch_name
 
     channel_breakdown.sort(key=lambda x: x[1], reverse=True)
 
@@ -355,7 +367,7 @@ async def fetch_leaderboard_data(start_date: str, end_date: str):
             ch_query = """
                 SELECT channel_name, SUM(unmuted_seconds + muted_seconds + deafened_seconds) as ch_total
                 FROM voice_activity
-                WHERE user_id = ? AND record_date BETWEEN ? AND ?
+                WHERE user_id = ? AND record_date BETWEEN ? AND ? AND channel_name IS NOT NULL
                 GROUP BY channel_name
                 ORDER BY ch_total DESC
                 LIMIT 1
@@ -364,7 +376,7 @@ async def fetch_leaderboard_data(start_date: str, end_date: str):
 
             async with db.execute(ch_query, ch_params) as ch_cursor:
                 ch_row = await ch_cursor.fetchone()
-                primary_ch = ch_row[0] if ch_row else "None"
+                primary_ch = ch_row[0] if (ch_row and ch_row[0]) else "None"
 
             leaderboard.append({
                 "user_id": user_id,
@@ -396,11 +408,12 @@ def generate_stats_chart_sync(stats, channel_breakdown):
     ax1.set_title('Audio State Distribution', fontsize=14, pad=15)
 
     ax2 = fig.add_subplot(122)
-    if not channel_breakdown:
+    valid_channels = [(str(c[0]), c[1]) for c in (channel_breakdown or []) if c and c[0]]
+    if not valid_channels:
         ax2.text(0.5, 0.5, 'No Channel Data', ha='center', va='center', fontsize=12)
         ax2.axis('off')
     else:
-        top_channels = channel_breakdown[:5]
+        top_channels = valid_channels[:5]
         c_labels = [c[0][:12] + '...' if len(c[0]) > 12 else c[0] for c in top_channels]
         c_times = [c[1] / 3600 for c in top_channels]
 
@@ -429,7 +442,7 @@ async def generate_and_send_csv(target, timeframe_label: str = "last_month"):
             """
             SELECT user_name, user_id, channel_name, SUM(unmuted_seconds), SUM(muted_seconds), SUM(deafened_seconds)
             FROM voice_activity
-            WHERE record_date BETWEEN ? AND ?
+            WHERE record_date BETWEEN ? AND ? AND channel_name IS NOT NULL
             GROUP BY user_id, channel_name
             ORDER BY user_name, channel_name
         """,
@@ -457,7 +470,7 @@ async def generate_and_send_csv(target, timeframe_label: str = "last_month"):
             uname, uid, cname, unmuted, muted, deaf = row
             total = unmuted + muted + deaf
             writer.writerow([
-                uname, uid, cname,
+                uname, uid, cname or "Unknown",
                 format_duration(unmuted), format_duration(muted), format_duration(deaf), format_duration(total),
                 round(unmuted, 2), round(muted, 2), round(deaf, 2), round(total, 2)
             ])
@@ -506,7 +519,7 @@ async def fetch_role_activity_data(guild: discord.Guild, role: discord.Role, sta
                 SELECT user_id, user_name, channel_name,
                        SUM(unmuted_seconds), SUM(muted_seconds), SUM(deafened_seconds)
                 FROM voice_activity
-                WHERE user_id IN ({placeholders}) AND record_date BETWEEN ? AND ?
+                WHERE user_id IN ({placeholders}) AND record_date BETWEEN ? AND ? AND channel_name IS NOT NULL
                 GROUP BY user_id, channel_name
                 ORDER BY user_name, channel_name
             """
@@ -528,12 +541,13 @@ async def fetch_role_activity_data(guild: discord.Guild, role: discord.Role, sta
             user_stats[uid]["muted"] += muted_sec
             user_stats[uid]["deafened"] += deaf_sec
             user_stats[uid]["total"] += ch_total
-            user_stats[uid]["channels"][cname] = {
-                "unmuted": unmuted_sec,
-                "muted": muted_sec,
-                "deafened": deaf_sec,
-                "total": ch_total,
-            }
+            if cname:
+                user_stats[uid]["channels"][cname] = {
+                    "unmuted": unmuted_sec,
+                    "muted": muted_sec,
+                    "deafened": deaf_sec,
+                    "total": ch_total,
+                }
 
     total_unmuted = sum(u["unmuted"] for u in user_stats.values())
     total_muted = sum(u["muted"] for u in user_stats.values())
@@ -908,15 +922,15 @@ async def render_dashboard(interaction: discord.Interaction, member: discord.Mem
 
     # Safe Live Session Data Extractions (Fixed NoneType Issue)
     session = active_sessions.get(member.id)
-    if session and session.get("join_timestamp"):
-        current_vc = session.get("channel_name", "Not in Voice")
+    if session and session.get("channel_id") and session.get("join_timestamp"):
+        current_vc = session.get("channel_name", "Not in Voice") or "Not in Voice"
         join_ts = session.get("join_timestamp")
         join_time_formatted = datetime.fromtimestamp(join_ts, LOCAL_TZ).strftime("%I:%M %p") if join_ts else "N/A"
     else:
         current_vc = "Not in Voice"
         join_time_formatted = "N/A"
 
-    last_vc = session.get("last_channel_name", "None") if session else "None"
+    last_vc = last_connected_channels.get(member.id) or (session.get("last_channel_name") if session else None) or "None"
 
     embed = discord.Embed(
         title=f"🎙️ Voice Dashboard — {member.display_name}",
@@ -927,7 +941,7 @@ async def render_dashboard(interaction: discord.Interaction, member: discord.Mem
     # --- Clean Row 1: Timeframe, Total Voice Time, Primary Channel ---
     embed.add_field(name="⏳ Timeframe", value=f"`{label}`\n`{date_str}`", inline=True)
     embed.add_field(name="⏱️ Total Voice Time", value=f"`{format_duration(stats['total'])}`", inline=True)
-    embed.add_field(name="🔊 Primary Channel", value=f"`{stats['top_vc']}`", inline=True)
+    embed.add_field(name="🔊 Primary Channel", value=f"`{stats['top_vc'] or 'None'}`", inline=True)
 
     # --- Clean Row 2: Current VC, Join Time, Last Connected VC (Proper Spacing) ---
     embed.add_field(name="🎧 Current VC", value=f"`{current_vc}`", inline=True)
@@ -1113,13 +1127,14 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             existing = active_sessions[member.id]
             if before.channel and before.channel.id != after.channel.id:
                 last_vc = before.channel.name
+                last_connected_channels[member.id] = before.channel.name
             else:
                 last_vc = existing.get("last_channel_name", "None")
             
             # Safe check for join_timestamp to prevent NoneType errors
             join_ts = existing.get("join_timestamp") or now
         else:
-            last_vc = "None"
+            last_vc = last_connected_channels.get(member.id, "None")
             join_ts = now
 
         active_sessions[member.id] = {
@@ -1133,16 +1148,11 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         }
     else:
         if member.id in active_sessions:
-            last_vc = active_sessions[member.id]["channel_name"]
-            active_sessions[member.id] = {
-                "channel_id": None,
-                "channel_name": None,
-                "last_channel_name": last_vc,
-                "join_timestamp": None,
-                "state": "unmuted",
-                "last_update": now,
-                "name": member.display_name,
-            }
+            last_vc = active_sessions[member.id].get("channel_name") or "None"
+            last_connected_channels[member.id] = last_vc
+            del active_sessions[member.id]
+        elif before.channel:
+            last_connected_channels[member.id] = before.channel.name
 
     # Update Deafen tracking
     if after.channel and (after.self_deaf or after.deaf):
