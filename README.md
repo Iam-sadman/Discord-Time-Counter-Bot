@@ -26,7 +26,17 @@ In remote workflows and data annotation environments (e.g., machine learning lab
 * **Active vs. Inactive Workforce Auditing**:
   * **`🟢 Active Members`**: Workers with `work_time > 0h` ranked by total hours.
   * **`🔴 Inactive (0h)`**: Instantly lists all workers recorded with `0 hours` for the selected period alongside their team name so supervisors can identify inactive staff immediately.
-* **Correction System (`/ecoda_edit`)**: If a team leader accidentally uploads duplicate, faulty, or wrong data, supervisors can correct a worker's hours or team name for any date without wiping the database.
+* **Correction & Manual Add System (`/ecoda_edit`, `/ecoda_add`)**:
+  * Correct hours or team names for any date with `/ecoda_edit`.
+  * Manually log missed work hours for any worker with `/ecoda_add [worker] [hours] [role] [team] [date]`.
+* **Record Deletion (`/ecoda_delete`, `/ecoda_delete_date`)**:
+  * Delete specific worker records across all dates or for a specific date using `/ecoda_delete`.
+  * Wipe all records for a faulty upload date using `/ecoda_delete_date`.
+* **External Worker Blacklist / Exclusion (`/ecoda_exclude`)**:
+  * Permanently hide external labelers from leaderboards (`/ecoda_exclude add [worker]`).
+  * Automatically skips blacklisted workers during daily sheet uploads.
+* **Interactive Discord Calendar Date Picker**:
+  * Instead of manually typing date strings, commands feature an interactive Calendar View with month navigation, cutoff dropdown selectors, and one-click `Today` and `Yesterday` buttons.
 
 ### 2. 📅 Bi-Monthly Cutoff Tracking (1st & 2nd Cutoffs)
 * In workforce management, productivity is calculated across two monthly cutoff periods:

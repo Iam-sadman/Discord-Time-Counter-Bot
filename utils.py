@@ -330,6 +330,15 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_ecoda_date ON ecoda_records(record_date)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_ecoda_user ON ecoda_records(user_id)")
 
+        # ECODA excluded workers table (blacklist)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS ecoda_excluded_workers (
+                ecoda_name TEXT PRIMARY KEY COLLATE NOCASE,
+                added_by INTEGER,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # Settings table for dynamic configurations
         await db.execute("""
             CREATE TABLE IF NOT EXISTS bot_settings (
@@ -943,11 +952,17 @@ def parse_ecoda_file(file_bytes: bytes, filename: str, default_team_name: str | 
 
 
 async def save_ecoda_records(records: list[dict], record_date: str, uploaded_by: int) -> int:
-    """Inserts or updates ECODA worker records for the given date, including team_name."""
+    """Inserts or updates ECODA worker records for the given date, skipping blacklisted workers."""
     if not records:
         return 0
     async with aiosqlite.connect(DB_FILE) as db:
+        cursor = await db.execute("SELECT LOWER(TRIM(ecoda_name)) FROM ecoda_excluded_workers")
+        excluded_set = {row[0] for row in await cursor.fetchall()}
+
+        saved_count = 0
         for r in records:
+            if r["ecoda_name"].strip().lower() in excluded_set:
+                continue
             await db.execute("""
                 INSERT INTO ecoda_records (
                     user_id, ecoda_name, role_type, work_time, group_id, team_id, team_name, record_date, uploaded_by
@@ -972,8 +987,9 @@ async def save_ecoda_records(records: list[dict], record_date: str, uploaded_by:
                 record_date,
                 uploaded_by,
             ))
+            saved_count += 1
         await db.commit()
-    return len(records)
+    return saved_count
 
 
 async def fetch_ecoda_leaderboard_data(
@@ -997,6 +1013,7 @@ async def fetch_ecoda_leaderboard_data(
             COUNT(DISTINCT record_date) as active_days
         FROM ecoda_records
         WHERE 1=1
+          AND LOWER(TRIM(ecoda_name)) NOT IN (SELECT LOWER(TRIM(ecoda_name)) FROM ecoda_excluded_workers)
     """
     params = []
     if start_date:
@@ -1101,6 +1118,147 @@ async def update_ecoda_work_time(
             "team_name": final_team,
             "record_date": record_date,
         }
+
+
+async def add_ecoda_excluded_worker(ecoda_name: str, added_by: int) -> bool:
+    """Adds a worker to the excluded/blacklist table to hide them from all leaderboards."""
+    clean_name = ecoda_name.strip()
+    if not clean_name:
+        return False
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("""
+            INSERT INTO ecoda_excluded_workers (ecoda_name, added_by)
+            VALUES (?, ?)
+            ON CONFLICT(ecoda_name) DO UPDATE SET added_by = excluded.added_by, added_at = CURRENT_TIMESTAMP
+        """, (clean_name, added_by))
+        await db.commit()
+    return True
+
+
+async def remove_ecoda_excluded_worker(ecoda_name: str) -> bool:
+    """Removes a worker from the excluded/blacklist table."""
+    clean_name = ecoda_name.strip()
+    if not clean_name:
+        return False
+    async with aiosqlite.connect(DB_FILE) as db:
+        cursor = await db.execute(
+            "DELETE FROM ecoda_excluded_workers WHERE LOWER(TRIM(ecoda_name)) = LOWER(TRIM(?))",
+            (clean_name,)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def get_ecoda_excluded_workers() -> list[dict]:
+    """Returns a list of all blacklisted workers."""
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT ecoda_name, added_by, added_at FROM ecoda_excluded_workers ORDER BY ecoda_name ASC"
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def add_ecoda_manual_record(
+    worker_name: str,
+    hours: float,
+    record_date: str,
+    role_type: int = 0,
+    team_name: str | None = None,
+    user_id: int | None = None,
+    added_by: int = 0,
+) -> dict:
+    """Manually creates or updates an ECODA work record for a worker on a specific date."""
+    clean_name = worker_name.strip()
+    clean_team = team_name.strip() if team_name and team_name.strip() else None
+    hours = max(0.0, float(hours))
+
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("""
+            INSERT INTO ecoda_records (
+                user_id, ecoda_name, role_type, work_time, team_name, record_date, uploaded_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(ecoda_name, record_date) DO UPDATE SET
+                user_id = COALESCE(excluded.user_id, ecoda_records.user_id),
+                role_type = excluded.role_type,
+                work_time = excluded.work_time,
+                team_name = COALESCE(excluded.team_name, ecoda_records.team_name),
+                uploaded_by = excluded.uploaded_by,
+                upload_timestamp = CURRENT_TIMESTAMP
+        """, (user_id, clean_name, role_type, hours, clean_team, record_date, added_by))
+        await db.commit()
+
+    return {
+        "ecoda_name": clean_name,
+        "user_id": user_id,
+        "role_type": role_type,
+        "hours": hours,
+        "team_name": clean_team,
+        "record_date": record_date,
+    }
+
+
+async def delete_ecoda_record(
+    worker_query: str,
+    record_date: str | None = None,
+) -> tuple[int, str]:
+    """
+    Deletes ECODA records matching worker_query (user_id or name).
+    If record_date is provided and not in ('all', None), deletes only for that date.
+    Returns (deleted_count, matched_display_name).
+    """
+    clean_query = worker_query.strip()
+    digits = re.findall(r"\d+", clean_query)
+    user_id = int(digits[0]) if digits and len(digits[0]) >= 15 else None
+
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+
+        # Try to find existing record to get canonical name
+        row = None
+        if user_id:
+            cursor = await db.execute("SELECT ecoda_name FROM ecoda_records WHERE user_id = ? LIMIT 1", (user_id,))
+            row = await cursor.fetchone()
+        if not row:
+            cursor = await db.execute("SELECT ecoda_name FROM ecoda_records WHERE LOWER(TRIM(ecoda_name)) = LOWER(TRIM(?)) LIMIT 1", (clean_query,))
+            row = await cursor.fetchone()
+        if not row:
+            cursor = await db.execute("SELECT ecoda_name FROM ecoda_records WHERE LOWER(ecoda_name) LIKE ? LIMIT 1", (f"%{clean_query.lower()}%",))
+            row = await cursor.fetchone()
+
+        matched_name = row["ecoda_name"] if row else clean_query
+
+        conditions = []
+        params = []
+
+        if user_id:
+            conditions.append("(user_id = ? OR LOWER(TRIM(ecoda_name)) = LOWER(TRIM(?)))")
+            params.extend([user_id, clean_query])
+        else:
+            if row:
+                conditions.append("LOWER(TRIM(ecoda_name)) = LOWER(TRIM(?))")
+                params.append(matched_name)
+            else:
+                conditions.append("LOWER(ecoda_name) LIKE ?")
+                params.append(f"%{clean_query.lower()}%")
+
+        if record_date and record_date.lower() != "all":
+            conditions.append("record_date = ?")
+            params.append(record_date)
+
+        where_clause = " AND ".join(conditions)
+        cursor = await db.execute(f"DELETE FROM ecoda_records WHERE {where_clause}", params)
+        await db.commit()
+        return cursor.rowcount, matched_name
+
+
+async def delete_ecoda_by_date(record_date: str) -> int:
+    """Deletes all ECODA records on a specific date. Returns number of rows deleted."""
+    async with aiosqlite.connect(DB_FILE) as db:
+        cursor = await db.execute("DELETE FROM ecoda_records WHERE record_date = ?", (record_date,))
+        await db.commit()
+        return cursor.rowcount
 
 
 # ==========================================

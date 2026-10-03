@@ -17,20 +17,28 @@ Features:
     Role filter (All, Labelers, Checkers), and multi-page pagination.
 """
 
-from datetime import datetime
+import calendar
+from datetime import datetime, timedelta
+import re
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from utils import (
     LOCAL_TZ,
+    add_ecoda_excluded_worker,
+    add_ecoda_manual_record,
+    delete_ecoda_by_date,
+    delete_ecoda_record,
     find_member_by_name,
     format_hours,
     get_date_range,
+    get_ecoda_excluded_workers,
     get_setting,
     is_ecoda_checker,
     parse_custom_date,
     parse_ecoda_file,
+    remove_ecoda_excluded_worker,
     resolve_member_display,
     save_ecoda_records,
     set_setting,
@@ -270,6 +278,219 @@ async def render_ecoda_leaderboard(interaction: discord.Interaction, view: Ecoda
 
 
 # ==========================================
+# INTERACTIVE CALENDAR DATE PICKER VIEW
+# ==========================================
+class CalendarDatePickerView(discord.ui.View):
+    """Interactive Discord Calendar view with month navigation and cutoff day dropdowns."""
+
+    def __init__(
+        self,
+        author_id: int,
+        on_date_selected,  # async callable: (interaction, date_str) -> None
+        year: int | None = None,
+        month: int | None = None,
+    ):
+        super().__init__(timeout=180)
+        self.author_id = author_id
+        self.on_date_selected = on_date_selected
+
+        now = datetime.now(LOCAL_TZ)
+        self.year = year or now.year
+        self.month = month or now.month
+        self.today_str = now.strftime("%Y-%m-%d")
+        self.yesterday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        self.setup_components()
+
+    def setup_components(self):
+        self.clear_items()
+        month_name = calendar.month_name[self.month]
+        month_abbr = calendar.month_abbr[self.month]
+        last_day = calendar.monthrange(self.year, self.month)[1]
+
+        # Row 0: Navigation Buttons
+        btn_prev = discord.ui.Button(label="◀️ Prev", style=discord.ButtonStyle.secondary, row=0)
+        btn_prev.callback = self.prev_month
+        self.add_item(btn_prev)
+
+        btn_header = discord.ui.Button(
+            label=f"📅 {month_name} {self.year}",
+            style=discord.ButtonStyle.primary,
+            disabled=True,
+            row=0,
+        )
+        self.add_item(btn_header)
+
+        btn_next = discord.ui.Button(label="Next ▶️", style=discord.ButtonStyle.secondary, row=0)
+        btn_next.callback = self.next_month
+        self.add_item(btn_next)
+
+        # Row 1: 1st Cutoff Days (Days 1 to min(15, last_day))
+        part1_options = []
+        for d in range(1, min(16, last_day + 1)):
+            dt = datetime(self.year, self.month, d)
+            d_str = dt.strftime("%Y-%m-%d")
+            weekday = dt.strftime("%a")
+            if d_str == self.today_str:
+                label = f"☀️ {d:02d} {month_abbr} ({weekday}) — Today"
+            elif d_str == self.yesterday_str:
+                label = f"⏪ {d:02d} {month_abbr} ({weekday}) — Yesterday"
+            else:
+                label = f"{d:02d} {month_abbr} ({weekday})"
+            part1_options.append(discord.SelectOption(label=label, value=d_str))
+
+        if part1_options:
+            select1 = discord.ui.Select(
+                placeholder=f"⏳ 1st Cutoff (Days 01-15 {month_abbr})...",
+                options=part1_options,
+                row=1,
+            )
+            select1.callback = self.select_day_callback
+            self.add_item(select1)
+
+        # Row 2: 2nd Cutoff Days (Days 16 to last_day)
+        part2_options = []
+        if last_day >= 16:
+            for d in range(16, last_day + 1):
+                dt = datetime(self.year, self.month, d)
+                d_str = dt.strftime("%Y-%m-%d")
+                weekday = dt.strftime("%a")
+                if d_str == self.today_str:
+                    label = f"☀️ {d:02d} {month_abbr} ({weekday}) — Today"
+                elif d_str == self.yesterday_str:
+                    label = f"⏪ {d:02d} {month_abbr} ({weekday}) — Yesterday"
+                else:
+                    label = f"{d:02d} {month_abbr} ({weekday})"
+                part2_options.append(discord.SelectOption(label=label, value=d_str))
+
+        if part2_options:
+            select2 = discord.ui.Select(
+                placeholder=f"⏳ 2nd Cutoff (Days 16-{last_day} {month_abbr})...",
+                options=part2_options,
+                row=2,
+            )
+            select2.callback = self.select_day_callback
+            self.add_item(select2)
+
+        # Row 3: Quick Action Buttons
+        btn_today = discord.ui.Button(
+            label=f"☀️ Today ({self.today_str[-5:]})",
+            style=discord.ButtonStyle.success,
+            row=3,
+        )
+        btn_today.callback = self.quick_today
+        self.add_item(btn_today)
+
+        btn_yesterday = discord.ui.Button(
+            label=f"⏪ Yesterday ({self.yesterday_str[-5:]})",
+            style=discord.ButtonStyle.secondary,
+            row=3,
+        )
+        btn_yesterday.callback = self.quick_yesterday
+        self.add_item(btn_yesterday)
+
+        btn_cancel = discord.ui.Button(label="❌ Cancel", style=discord.ButtonStyle.danger, row=3)
+        btn_cancel.callback = self.cancel_callback
+        self.add_item(btn_cancel)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "❌ This date picker belongs to another user.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def prev_month(self, interaction: discord.Interaction):
+        if self.month == 1:
+            self.month = 12
+            self.year -= 1
+        else:
+            self.month -= 1
+        self.setup_components()
+        await interaction.response.edit_message(view=self)
+
+    async def next_month(self, interaction: discord.Interaction):
+        if self.month == 12:
+            self.month = 1
+            self.year += 1
+        else:
+            self.month += 1
+        self.setup_components()
+        await interaction.response.edit_message(view=self)
+
+    async def select_day_callback(self, interaction: discord.Interaction):
+        values = interaction.data.get("values", [])
+        if values:
+            for item in self.children:
+                item.disabled = True
+            await self.on_date_selected(interaction, values[0])
+
+    async def quick_today(self, interaction: discord.Interaction):
+        for item in self.children:
+            item.disabled = True
+        await self.on_date_selected(interaction, self.today_str)
+
+    async def quick_yesterday(self, interaction: discord.Interaction):
+        for item in self.children:
+            item.disabled = True
+        await self.on_date_selected(interaction, self.yesterday_str)
+
+    async def cancel_callback(self, interaction: discord.Interaction):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="❌ Operation cancelled.", embed=None, view=None)
+
+
+# ==========================================
+# INTERACTIVE DELETE PROMPT VIEW
+# ==========================================
+class EcodaDeletePromptView(discord.ui.View):
+    """View offering choices to delete all dates, today, yesterday, or pick from calendar."""
+
+    def __init__(self, author_id: int, on_action):
+        super().__init__(timeout=180)
+        self.author_id = author_id
+        self.on_action = on_action
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ This prompt is not for you.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="🗑️ Delete ALL Dates", style=discord.ButtonStyle.danger, row=0)
+    async def btn_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await self.on_action(interaction, "all")
+
+    @discord.ui.button(label="☀️ Today", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_today(self, interaction: discord.Interaction, button: discord.ui.Button):
+        now_str = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
+        for item in self.children:
+            item.disabled = True
+        await self.on_action(interaction, now_str)
+
+    @discord.ui.button(label="⏪ Yesterday", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_yesterday(self, interaction: discord.Interaction, button: discord.ui.Button):
+        yest_str = (datetime.now(LOCAL_TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
+        for item in self.children:
+            item.disabled = True
+        await self.on_action(interaction, yest_str)
+
+    @discord.ui.button(label="📅 Pick from Calendar", style=discord.ButtonStyle.primary, row=0)
+    async def btn_calendar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.on_action(interaction, "calendar")
+
+    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="❌ Deletion cancelled.", embed=None, view=None)
+
+
+# ==========================================
 # COG CLASS
 # ==========================================
 class EcodaCog(commands.Cog):
@@ -419,53 +640,82 @@ class EcodaCog(commands.Cog):
         await interaction.followup.send(embed=embed)
 
     # ------------------------------------------
-    # SLASH COMMAND: /ecoda_edit
+    # HELPER EXECUTION METHODS
     # ------------------------------------------
-    @app_commands.command(
-        name="ecoda_edit",
-        description="Edit or correct a worker's work hours or team for a specific date [Team Leader / Admin only].",
-    )
-    @app_commands.describe(
-        worker="Worker's Discord mention (@user) or exact sheet name (e.g. ARC_Shikto Kumar Das)",
-        hours="Corrected work hours (e.g. 2.5 or 0)",
-        team="Update or set Team Name for this worker [Optional]",
-        date="Record date in YYYY-MM-DD format (defaults to today)",
-        note="Optional reason or note for this edit",
-    )
-    async def ecoda_edit(
+    async def _execute_add(
         self,
         interaction: discord.Interaction,
         worker: str,
         hours: float,
-        team: str | None = None,
-        date: str | None = None,
-        note: str | None = None,
+        record_date: str,
+        role_type: int,
+        team: str | None,
     ):
-        # 1. Permission check
-        if not await is_ecoda_checker(interaction.user):
-            await interaction.response.send_message(
-                "❌ **Access Denied:** Only members with the **Checker / Team Leader** role or Server Administrators can edit ECODA work hours.",
-                ephemeral=True,
-            )
-            return
+        """Executes manual record creation and updates live boards."""
+        if not interaction.response.is_done():
+            await interaction.response.defer()
 
-        # 2. Determine record date
-        now_local = datetime.now(LOCAL_TZ)
-        if date:
-            parsed = parse_custom_date(date)
-            if not parsed:
-                await interaction.response.send_message(
-                    "❌ Invalid date format! Please use `YYYY-MM-DD` (e.g. `2026-10-02`).",
-                    ephemeral=True,
-                )
-                return
-            record_date = parsed
+        clean_worker = worker.strip()
+        digits = re.findall(r"\d+", clean_worker)
+        member = None
+        if digits and len(digits[0]) >= 15 and interaction.guild:
+            member = interaction.guild.get_member(int(digits[0]))
+        if not member and interaction.guild:
+            member = find_member_by_name(interaction.guild, clean_worker)
+
+        if member:
+            user_id = member.id
+            ecoda_name = member.display_name if clean_worker.startswith("<@") or clean_worker.isdigit() else clean_worker
         else:
-            record_date = now_local.strftime("%Y-%m-%d")
+            user_id = None
+            ecoda_name = clean_worker
 
-        await interaction.response.defer()
+        res = await add_ecoda_manual_record(
+            worker_name=ecoda_name,
+            hours=hours,
+            record_date=record_date,
+            role_type=role_type,
+            team_name=team,
+            user_id=user_id,
+            added_by=interaction.user.id,
+        )
 
-        # 3. Update record in database
+        await update_live_leaderboard_messages(self.bot)
+
+        display_str, _ = resolve_member_display(interaction.guild, res["ecoda_name"], res.get("user_id"))
+        role_badge = "🏷️ Labeler" if role_type == 0 else "🔍 Checker"
+
+        embed = discord.Embed(
+            title="✅ ECODA Work Hours Added",
+            description=f"Successfully logged manual work record for {display_str}.",
+            color=discord.Color.green(),
+        )
+        embed.add_field(name="📅 Record Date", value=f"`{record_date}`", inline=True)
+        embed.add_field(name="⏱️ Work Hours", value=f"`{format_hours(res['hours'])}` ({round(res['hours'], 2)}h)", inline=True)
+        embed.add_field(name="🏷️ Role", value=f"`{role_badge}`", inline=True)
+        if res.get("team_name"):
+            embed.add_field(name="🛡️ Team", value=f"`{res['team_name']}`", inline=True)
+        embed.add_field(name="👤 Added By", value=f"<@{interaction.user.id}>", inline=True)
+        embed.set_footer(text="Live dynamic leaderboards have been automatically refreshed.")
+
+        if interaction.response.is_done():
+            await interaction.edit_original_response(content="", embed=embed, view=None)
+        else:
+            await interaction.followup.send(embed=embed)
+
+    async def _execute_edit(
+        self,
+        interaction: discord.Interaction,
+        worker: str,
+        hours: float,
+        record_date: str,
+        team: str | None,
+        note: str | None,
+    ):
+        """Executes record modification and updates live boards."""
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+
         updated = await update_ecoda_work_time(
             worker_query=worker,
             record_date=record_date,
@@ -475,19 +725,18 @@ class EcodaCog(commands.Cog):
         )
 
         if not updated:
-            await interaction.followup.send(
-                f"❌ Could not find any ECODA record matching `{worker}` on `{record_date}`. Please verify the name or date."
-            )
+            msg = f"❌ Could not find any ECODA record matching `{worker}` on `{record_date}`. Please verify the name or date."
+            if interaction.response.is_done():
+                await interaction.edit_original_response(content=msg, embed=None, view=None)
+            else:
+                await interaction.followup.send(msg)
             return
 
-        # 4. Trigger live leaderboard refresh
         await update_live_leaderboard_messages(self.bot)
 
-        # 5. Build response embed
         display_str, _ = resolve_member_display(
             interaction.guild, updated["ecoda_name"], updated.get("user_id")
         )
-
         old_str = format_hours(updated["old_hours"])
         new_str = format_hours(updated["new_hours"])
 
@@ -505,8 +754,419 @@ class EcodaCog(commands.Cog):
         if note:
             embed.add_field(name="📝 Reason / Note", value=note, inline=False)
 
-        embed.set_footer(text="Live leaderboards have been automatically refreshed.")
-        await interaction.followup.send(embed=embed)
+        embed.set_footer(text="Live dynamic leaderboards have been automatically refreshed.")
+        if interaction.response.is_done():
+            await interaction.edit_original_response(content="", embed=embed, view=None)
+        else:
+            await interaction.followup.send(embed=embed)
+
+    async def _execute_delete(
+        self,
+        interaction: discord.Interaction,
+        worker: str,
+        record_date: str | None,
+    ):
+        """Executes record deletion and updates live boards."""
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+
+        deleted_count, matched_name = await delete_ecoda_record(worker, record_date)
+        if deleted_count == 0:
+            msg = f"⚠️ No records found for `{worker}`" + (f" on `{record_date}`." if record_date and record_date != "all" else ".")
+            if interaction.response.is_done():
+                await interaction.edit_original_response(content=msg, embed=None, view=None)
+            else:
+                await interaction.followup.send(msg)
+            return
+
+        await update_live_leaderboard_messages(self.bot)
+
+        date_scope = "All Historical Dates" if not record_date or record_date.lower() == "all" else f"`{record_date}`"
+        embed = discord.Embed(
+            title="🗑️ ECODA Record(s) Deleted",
+            description="Successfully deleted record(s) from the database.",
+            color=discord.Color.orange(),
+        )
+        embed.add_field(name="👤 Worker", value=f"**`{matched_name}`**", inline=True)
+        embed.add_field(name="📅 Scope / Date", value=date_scope, inline=True)
+        embed.add_field(name="🔢 Rows Deleted", value=f"`{deleted_count}` record(s)", inline=True)
+        embed.add_field(name="👤 Deleted By", value=f"<@{interaction.user.id}>", inline=True)
+        embed.set_footer(text="Live dynamic leaderboards have been automatically refreshed.")
+
+        if interaction.response.is_done():
+            await interaction.edit_original_response(content="", embed=embed, view=None)
+        else:
+            await interaction.followup.send(embed=embed)
+
+    # ------------------------------------------
+    # SLASH COMMAND: /ecoda_add
+    # ------------------------------------------
+    @app_commands.command(
+        name="ecoda_add",
+        description="Manually add or log missed ECODA work hours for a worker [Team Leader / Admin only].",
+    )
+    @app_commands.describe(
+        worker="Worker's Discord mention (@user) or exact sheet name (e.g. ARC_Shikto)",
+        hours="Work hours (e.g. 3.5)",
+        role="Worker's role (Labeler or Checker)",
+        team="Optional Team Name (e.g. Alpha, Titans)",
+        date="Record date in YYYY-MM-DD format (leave empty to pick from Calendar)",
+    )
+    @app_commands.choices(
+        role=[
+            app_commands.Choice(name="🏷️ Labeler", value=0),
+            app_commands.Choice(name="🔍 Checker", value=1),
+        ]
+    )
+    async def ecoda_add(
+        self,
+        interaction: discord.Interaction,
+        worker: str,
+        hours: float,
+        role: int = 0,
+        team: str | None = None,
+        date: str | None = None,
+    ):
+        if not await is_ecoda_checker(interaction.user):
+            await interaction.response.send_message(
+                "❌ **Access Denied:** Only members with the **Checker / Team Leader** role or Server Administrators can add ECODA work hours.",
+                ephemeral=True,
+            )
+            return
+
+        if date:
+            parsed = parse_custom_date(date)
+            if not parsed:
+                await interaction.response.send_message(
+                    "❌ Invalid date format! Please use `YYYY-MM-DD` (e.g. `2026-10-02`) or leave date empty to select from the Calendar.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.defer()
+            await self._execute_add(interaction, worker, hours, parsed, role, team)
+        else:
+            role_badge = "🏷️ Labeler" if role == 0 else "🔍 Checker"
+            prompt_embed = discord.Embed(
+                title="📅 Select Date for ECODA Record",
+                description=(
+                    f"**Worker:** `{worker}`\n"
+                    f"**Hours:** `{format_hours(hours)}` ({round(hours, 2)}h)\n"
+                    f"**Role:** `{role_badge}`\n"
+                    f"{f'**Team:** `{team}`\n' if team else ''}\n"
+                    "👇 *Please select the record date from the cutoffs below or click **Today** / **Yesterday**:*"
+                ),
+                color=discord.Color.teal(),
+            )
+
+            async def on_picked(i: discord.Interaction, picked_date: str):
+                await self._execute_add(i, worker, hours, picked_date, role, team)
+
+            view = CalendarDatePickerView(author_id=interaction.user.id, on_date_selected=on_picked)
+            await interaction.response.send_message(embed=prompt_embed, view=view)
+
+    # ------------------------------------------
+    # SLASH COMMAND: /ecoda_edit
+    # ------------------------------------------
+    @app_commands.command(
+        name="ecoda_edit",
+        description="Edit or correct a worker's work hours or team for a specific date [Team Leader / Admin only].",
+    )
+    @app_commands.describe(
+        worker="Worker's Discord mention (@user) or exact sheet name (e.g. ARC_Shikto Kumar Das)",
+        hours="Corrected work hours (e.g. 2.5 or 0)",
+        team="Update or set Team Name for this worker [Optional]",
+        date="Record date in YYYY-MM-DD format (leave empty to pick from Calendar)",
+        note="Optional reason or note for this edit",
+    )
+    async def ecoda_edit(
+        self,
+        interaction: discord.Interaction,
+        worker: str,
+        hours: float,
+        team: str | None = None,
+        date: str | None = None,
+        note: str | None = None,
+    ):
+        if not await is_ecoda_checker(interaction.user):
+            await interaction.response.send_message(
+                "❌ **Access Denied:** Only members with the **Checker / Team Leader** role or Server Administrators can edit ECODA work hours.",
+                ephemeral=True,
+            )
+            return
+
+        if date:
+            parsed = parse_custom_date(date)
+            if not parsed:
+                await interaction.response.send_message(
+                    "❌ Invalid date format! Please use `YYYY-MM-DD` (e.g. `2026-10-02`) or leave date empty to select from the Calendar.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.defer()
+            await self._execute_edit(interaction, worker, hours, parsed, team, note)
+        else:
+            prompt_embed = discord.Embed(
+                title="📅 Select Date to Edit ECODA Work Hours",
+                description=(
+                    f"**Worker:** `{worker}`\n"
+                    f"**New Hours:** `{format_hours(hours)}` ({round(hours, 2)}h)\n\n"
+                    "👇 *Please select the date to correct from the cutoffs below or click **Today** / **Yesterday**:*"
+                ),
+                color=discord.Color.blue(),
+            )
+
+            async def on_picked(i: discord.Interaction, picked_date: str):
+                await self._execute_edit(i, worker, hours, picked_date, team, note)
+
+            view = CalendarDatePickerView(author_id=interaction.user.id, on_date_selected=on_picked)
+            await interaction.response.send_message(embed=prompt_embed, view=view)
+
+    # ------------------------------------------
+    # SLASH COMMAND: /ecoda_delete
+    # ------------------------------------------
+    @app_commands.command(
+        name="ecoda_delete",
+        description="Delete a worker's record from ECODA database [Team Leader / Admin only].",
+    )
+    @app_commands.describe(
+        worker="Worker's Discord mention (@user) or exact sheet name",
+        date="Specific date (YYYY-MM-DD), 'all' for all records, or leave empty to choose interactively",
+    )
+    async def ecoda_delete(
+        self,
+        interaction: discord.Interaction,
+        worker: str,
+        date: str | None = None,
+    ):
+        if not await is_ecoda_checker(interaction.user):
+            await interaction.response.send_message(
+                "❌ **Access Denied:** Only members with the **Checker / Team Leader** role or Server Administrators can delete ECODA records.",
+                ephemeral=True,
+            )
+            return
+
+        if date:
+            if date.lower() == "all":
+                await interaction.response.defer()
+                await self._execute_delete(interaction, worker, "all")
+            else:
+                parsed = parse_custom_date(date)
+                if not parsed:
+                    await interaction.response.send_message(
+                        "❌ Invalid date format! Please use `YYYY-MM-DD` (e.g. `2026-10-02`), `'all'`, or leave date empty to select interactively.",
+                        ephemeral=True,
+                    )
+                    return
+                await interaction.response.defer()
+                await self._execute_delete(interaction, worker, parsed)
+        else:
+            prompt_embed = discord.Embed(
+                title="🗑️ Delete ECODA Records",
+                description=(
+                    f"**Worker Target:** `{worker}`\n\n"
+                    "How would you like to delete this worker's data?\n"
+                    "• **Delete ALL Dates**: Removes all historical records for this worker.\n"
+                    "• **Today / Yesterday**: Removes records for today or yesterday only.\n"
+                    "• **Pick from Calendar**: Select any specific date from the calendar."
+                ),
+                color=discord.Color.red(),
+            )
+
+            async def handle_delete_choice(i: discord.Interaction, choice: str):
+                if choice == "calendar":
+                    cal_embed = discord.Embed(
+                        title="📅 Select Date to Delete",
+                        description=f"Select the exact date to delete records for `{worker}`:",
+                        color=discord.Color.red(),
+                    )
+
+                    async def on_cal_selected(ci: discord.Interaction, picked_date: str):
+                        await self._execute_delete(ci, worker, picked_date)
+
+                    cal_view = CalendarDatePickerView(author_id=interaction.user.id, on_date_selected=on_cal_selected)
+                    await i.response.edit_message(embed=cal_embed, view=cal_view)
+                else:
+                    await self._execute_delete(i, worker, choice)
+
+            view = EcodaDeletePromptView(author_id=interaction.user.id, on_action=handle_delete_choice)
+            await interaction.response.send_message(embed=prompt_embed, view=view)
+
+    # ------------------------------------------
+    # SLASH COMMAND: /ecoda_delete_date
+    # ------------------------------------------
+    @app_commands.command(
+        name="ecoda_delete_date",
+        description="Delete ALL worker records for an entire specific date (e.g. faulty sheet) [Admin only].",
+    )
+    @app_commands.describe(
+        date="Date in YYYY-MM-DD format (leave empty to pick from Calendar)",
+    )
+    async def ecoda_delete_date(
+        self,
+        interaction: discord.Interaction,
+        date: str | None = None,
+    ):
+        if not await is_ecoda_checker(interaction.user):
+            await interaction.response.send_message(
+                "❌ **Access Denied:** Only members with the **Checker / Team Leader** role or Server Administrators can delete ECODA records.",
+                ephemeral=True,
+            )
+            return
+
+        async def do_wipe_date(i: discord.Interaction, target_date: str):
+            if not i.response.is_done():
+                await i.response.defer()
+
+            deleted_count = await delete_ecoda_by_date(target_date)
+            await update_live_leaderboard_messages(self.bot)
+
+            embed = discord.Embed(
+                title="🗑️ Date Records Wiped",
+                description=f"Successfully wiped all ECODA records for **`{target_date}`**.",
+                color=discord.Color.dark_red(),
+            )
+            embed.add_field(name="📅 Target Date", value=f"`{target_date}`", inline=True)
+            embed.add_field(name="🔢 Rows Deleted", value=f"`{deleted_count}` workers", inline=True)
+            embed.add_field(name="👤 Deleted By", value=f"<@{i.user.id}>", inline=True)
+            embed.set_footer(text="Live dynamic leaderboards have been automatically refreshed.")
+
+            if i.response.is_done():
+                await i.edit_original_response(content="", embed=embed, view=None)
+            else:
+                await i.followup.send(embed=embed)
+
+        if date:
+            parsed = parse_custom_date(date)
+            if not parsed:
+                await interaction.response.send_message(
+                    "❌ Invalid date format! Please use `YYYY-MM-DD` (e.g. `2026-10-02`) or leave empty to pick from the Calendar.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.defer()
+            await do_wipe_date(interaction, parsed)
+        else:
+            prompt_embed = discord.Embed(
+                title="📅 Select Date to Wipe",
+                description="⚠️ *Select the date for which all uploaded ECODA records will be deleted from the database:*",
+                color=discord.Color.dark_red(),
+            )
+            view = CalendarDatePickerView(author_id=interaction.user.id, on_date_selected=do_wipe_date)
+            await interaction.response.send_message(embed=prompt_embed, view=view)
+
+    # ------------------------------------------
+    # SLASH COMMAND: /ecoda_exclude
+    # ------------------------------------------
+    @app_commands.command(
+        name="ecoda_exclude",
+        description="Manage external/unwanted labelers to hide them permanently from leaderboards [Admin only].",
+    )
+    @app_commands.describe(
+        action="Add to blacklist, remove from blacklist, or view list",
+        worker="Worker's sheet name or Discord mention (required for Add / Remove)",
+        delete_records="If True, also deletes their past records from the database [Default: False]",
+    )
+    @app_commands.choices(
+        action=[
+            app_commands.Choice(name="➕ Add to Blacklist (Hide from Leaderboard)", value="add"),
+            app_commands.Choice(name="➖ Remove from Blacklist (Unhide)", value="remove"),
+            app_commands.Choice(name="📋 List All Excluded Workers", value="list"),
+        ]
+    )
+    async def ecoda_exclude(
+        self,
+        interaction: discord.Interaction,
+        action: str,
+        worker: str | None = None,
+        delete_records: bool = False,
+    ):
+        if not await is_ecoda_checker(interaction.user):
+            await interaction.response.send_message(
+                "❌ **Access Denied:** Only Administrators or Team Leaders can manage the ECODA blacklist.",
+                ephemeral=True,
+            )
+            return
+
+        if action in ("add", "remove") and not worker:
+            await interaction.response.send_message(
+                "❌ Please specify the `worker` name or mention to add or remove.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+
+        if action == "add":
+            clean_name = worker.strip()
+            digits = re.findall(r"\d+", clean_name)
+            if digits and len(digits[0]) >= 15 and interaction.guild:
+                m = interaction.guild.get_member(int(digits[0]))
+                if m:
+                    clean_name = m.display_name
+
+            await add_ecoda_excluded_worker(clean_name, interaction.user.id)
+            deleted_count = 0
+            if delete_records:
+                deleted_count, _ = await delete_ecoda_record(clean_name, "all")
+
+            await update_live_leaderboard_messages(self.bot)
+
+            embed = discord.Embed(
+                title="🚫 Worker Blacklisted & Excluded",
+                description=(
+                    f"**`{clean_name}`** has been added to the ECODA exclusion list.\n\n"
+                    f"• They will **NO LONGER appear** on any live or historical leaderboards.\n"
+                    f"• Future sheet uploads containing their name will be automatically skipped.\n"
+                    + (f"• **`{deleted_count}`** existing records deleted from database." if delete_records else "• Existing database records retained (hidden from view).")
+                ),
+                color=discord.Color.red(),
+            )
+            embed.add_field(name="👤 Blacklisted By", value=f"<@{interaction.user.id}>", inline=True)
+            embed.set_footer(text="Live dynamic leaderboards have been automatically refreshed.")
+            await interaction.followup.send(embed=embed)
+
+        elif action == "remove":
+            clean_name = worker.strip()
+            removed = await remove_ecoda_excluded_worker(clean_name)
+            await update_live_leaderboard_messages(self.bot)
+
+            if removed:
+                embed = discord.Embed(
+                    title="✅ Worker Removed from Blacklist",
+                    description=f"**`{clean_name}`** has been removed from the exclusion list and can now appear on leaderboards.",
+                    color=discord.Color.green(),
+                )
+            else:
+                embed = discord.Embed(
+                    title="⚠️ Not Found in Blacklist",
+                    description=f"**`{clean_name}`** was not found in the exclusion list.",
+                    color=discord.Color.orange(),
+                )
+            await interaction.followup.send(embed=embed)
+
+        elif action == "list":
+            excluded_list = await get_ecoda_excluded_workers()
+            if not excluded_list:
+                embed = discord.Embed(
+                    title="📋 ECODA Excluded Workers (Blacklist)",
+                    description="*No workers are currently blacklisted. All uploaded workers appear on the leaderboard.*",
+                    color=discord.Color.blue(),
+                )
+            else:
+                lines = []
+                for idx, item in enumerate(excluded_list, 1):
+                    added_by_str = f"<@{item['added_by']}>" if item.get("added_by") else "Admin"
+                    lines.append(f"`#{idx}` **`{item['ecoda_name']}`** — Added by {added_by_str}")
+                embed = discord.Embed(
+                    title=f"📋 ECODA Excluded Workers ({len(excluded_list)} Total)",
+                    description=(
+                        "The following workers are excluded from all leaderboards and skipped during uploads:\n\n"
+                        + "\n".join(lines)
+                    ),
+                    color=discord.Color.dark_red(),
+                )
+                embed.set_footer(text="Use /ecoda_exclude action:Remove to restore any worker.")
+            await interaction.followup.send(embed=embed)
 
     # ------------------------------------------
     # SLASH COMMAND: /ecoda_set_role
