@@ -763,16 +763,31 @@ class EcodaCog(commands.Cog):
     async def _execute_delete(
         self,
         interaction: discord.Interaction,
-        worker: str,
+        workers_query: str,
         record_date: str | None,
     ):
-        """Executes record deletion and updates live boards."""
+        """Executes record deletion for single or multiple comma-separated workers and updates live boards."""
         if not interaction.response.is_done():
             await interaction.response.defer()
 
-        deleted_count, matched_name = await delete_ecoda_record(worker, record_date)
-        if deleted_count == 0:
-            msg = f"⚠️ No records found for `{worker}`" + (f" on `{record_date}`." if record_date and record_date != "all" else ".")
+        worker_list = [w.strip() for w in workers_query.split(",") if w.strip()]
+        if not worker_list:
+            msg = "❌ No valid worker names provided."
+            if interaction.response.is_done():
+                await interaction.edit_original_response(content=msg, embed=None, view=None)
+            else:
+                await interaction.followup.send(msg)
+            return
+
+        results = []
+        total_deleted = 0
+        for w in worker_list:
+            d_count, matched_name = await delete_ecoda_record(w, record_date)
+            total_deleted += d_count
+            results.append((matched_name, d_count))
+
+        if total_deleted == 0 and len(worker_list) == 1:
+            msg = f"⚠️ No records found for `{worker_list[0]}`" + (f" on `{record_date}`." if record_date and record_date != "all" else ".")
             if interaction.response.is_done():
                 await interaction.edit_original_response(content=msg, embed=None, view=None)
             else:
@@ -784,13 +799,17 @@ class EcodaCog(commands.Cog):
         date_scope = "All Historical Dates" if not record_date or record_date.lower() == "all" else f"`{record_date}`"
         embed = discord.Embed(
             title="🗑️ ECODA Record(s) Deleted",
-            description="Successfully deleted record(s) from the database.",
+            description=f"Processed **`{len(worker_list)}`** worker(s) from database.",
             color=discord.Color.orange(),
         )
-        embed.add_field(name="👤 Worker", value=f"**`{matched_name}`**", inline=True)
         embed.add_field(name="📅 Scope / Date", value=date_scope, inline=True)
-        embed.add_field(name="🔢 Rows Deleted", value=f"`{deleted_count}` record(s)", inline=True)
+        embed.add_field(name="🔢 Total Rows Deleted", value=f"`{total_deleted}` record(s)", inline=True)
         embed.add_field(name="👤 Deleted By", value=f"<@{interaction.user.id}>", inline=True)
+
+        lines = [f"• **`{name}`**: `{cnt}` row(s) deleted" for name, cnt in results[:15]]
+        if len(results) > 15:
+            lines.append(f"...and {len(results) - 15} more")
+        embed.add_field(name="👥 Processed Workers", value="\n".join(lines), inline=False)
         embed.set_footer(text="Live dynamic leaderboards have been automatically refreshed.")
 
         if interaction.response.is_done():
@@ -926,16 +945,16 @@ class EcodaCog(commands.Cog):
     # ------------------------------------------
     @app_commands.command(
         name="ecoda_delete",
-        description="Delete a worker's record from ECODA database [Team Leader / Admin only].",
+        description="Delete worker record(s) from ECODA database (supports multiple comma-separated workers).",
     )
     @app_commands.describe(
-        worker="Worker's Discord mention (@user) or exact sheet name",
+        workers="Worker sheet name(s) or Discord mention(s), comma-separated (e.g. Rahul, Suman, @Alex)",
         date="Specific date (YYYY-MM-DD), 'all' for all records, or leave empty to choose interactively",
     )
     async def ecoda_delete(
         self,
         interaction: discord.Interaction,
-        worker: str,
+        workers: str,
         date: str | None = None,
     ):
         if not await is_ecoda_checker(interaction.user):
@@ -948,7 +967,7 @@ class EcodaCog(commands.Cog):
         if date:
             if date.lower() == "all":
                 await interaction.response.defer()
-                await self._execute_delete(interaction, worker, "all")
+                await self._execute_delete(interaction, workers, "all")
             else:
                 parsed = parse_custom_date(date)
                 if not parsed:
@@ -958,14 +977,19 @@ class EcodaCog(commands.Cog):
                     )
                     return
                 await interaction.response.defer()
-                await self._execute_delete(interaction, worker, parsed)
+                await self._execute_delete(interaction, workers, parsed)
         else:
+            worker_list = [w.strip() for w in workers.split(",") if w.strip()]
+            preview_targets = ", ".join(f"`{w}`" for w in worker_list[:10])
+            if len(worker_list) > 10:
+                preview_targets += f" ...and {len(worker_list) - 10} more"
+
             prompt_embed = discord.Embed(
-                title="🗑️ Delete ECODA Records",
+                title=f"🗑️ Delete ECODA Records ({len(worker_list)} Worker(s))",
                 description=(
-                    f"**Worker Target:** `{worker}`\n\n"
-                    "How would you like to delete this worker's data?\n"
-                    "• **Delete ALL Dates**: Removes all historical records for this worker.\n"
+                    f"**Targets:** {preview_targets}\n\n"
+                    "How would you like to delete their data?\n"
+                    "• **Delete ALL Dates**: Removes all historical records for these workers.\n"
                     "• **Today / Yesterday**: Removes records for today or yesterday only.\n"
                     "• **Pick from Calendar**: Select any specific date from the calendar."
                 ),
@@ -976,17 +1000,17 @@ class EcodaCog(commands.Cog):
                 if choice == "calendar":
                     cal_embed = discord.Embed(
                         title="📅 Select Date to Delete",
-                        description=f"Select the exact date to delete records for `{worker}`:",
+                        description=f"Select the exact date to delete records for **`{len(worker_list)}`** worker(s):",
                         color=discord.Color.red(),
                     )
 
                     async def on_cal_selected(ci: discord.Interaction, picked_date: str):
-                        await self._execute_delete(ci, worker, picked_date)
+                        await self._execute_delete(ci, workers, picked_date)
 
                     cal_view = CalendarDatePickerView(author_id=interaction.user.id, on_date_selected=on_cal_selected)
                     await i.response.edit_message(embed=cal_embed, view=cal_view)
                 else:
-                    await self._execute_delete(i, worker, choice)
+                    await self._execute_delete(i, workers, choice)
 
             view = EcodaDeletePromptView(author_id=interaction.user.id, on_action=handle_delete_choice)
             await interaction.response.send_message(embed=prompt_embed, view=view)
@@ -1059,11 +1083,11 @@ class EcodaCog(commands.Cog):
     # ------------------------------------------
     @app_commands.command(
         name="ecoda_exclude",
-        description="Manage external/unwanted labelers to hide them permanently from leaderboards [Admin only].",
+        description="Manage external/unwanted labelers to hide them permanently (supports multiple comma-separated).",
     )
     @app_commands.describe(
         action="Add to blacklist, remove from blacklist, or view list",
-        worker="Worker's sheet name or Discord mention (required for Add / Remove)",
+        workers="Worker sheet name(s) or Discord mention(s), comma-separated (e.g. Rahul, Suman, @Alex)",
         delete_records="If True, also deletes their past records from the database [Default: False]",
     )
     @app_commands.choices(
@@ -1077,7 +1101,7 @@ class EcodaCog(commands.Cog):
         self,
         interaction: discord.Interaction,
         action: str,
-        worker: str | None = None,
+        workers: str | None = None,
         delete_records: bool = False,
     ):
         if not await is_ecoda_checker(interaction.user):
@@ -1087,9 +1111,9 @@ class EcodaCog(commands.Cog):
             )
             return
 
-        if action in ("add", "remove") and not worker:
+        if action in ("add", "remove") and not workers:
             await interaction.response.send_message(
-                "❌ Please specify the `worker` name or mention to add or remove.",
+                "❌ Please specify worker name(s) or mention(s) to add or remove (comma-separated if multiple).",
                 ephemeral=True,
             )
             return
@@ -1097,51 +1121,81 @@ class EcodaCog(commands.Cog):
         await interaction.response.defer()
 
         if action == "add":
-            clean_name = worker.strip()
-            digits = re.findall(r"\d+", clean_name)
-            if digits and len(digits[0]) >= 15 and interaction.guild:
-                m = interaction.guild.get_member(int(digits[0]))
-                if m:
-                    clean_name = m.display_name
+            raw_workers = [w.strip() for w in workers.split(",") if w.strip()]
+            total_deleted = 0
+            processed_names = []
 
-            await add_ecoda_excluded_worker(clean_name, interaction.user.id)
-            deleted_count = 0
-            if delete_records:
-                deleted_count, _ = await delete_ecoda_record(clean_name, "all")
+            for w in raw_workers:
+                clean_name = w
+                digits = re.findall(r"\d+", clean_name)
+                if digits and len(digits[0]) >= 15 and interaction.guild:
+                    m = interaction.guild.get_member(int(digits[0]))
+                    if m:
+                        clean_name = m.display_name
+
+                await add_ecoda_excluded_worker(clean_name, interaction.user.id)
+                if delete_records:
+                    d_count, _ = await delete_ecoda_record(clean_name, "all")
+                    total_deleted += d_count
+                processed_names.append(clean_name)
 
             await update_live_leaderboard_messages(self.bot)
 
             embed = discord.Embed(
-                title="🚫 Worker Blacklisted & Excluded",
+                title=f"🚫 {len(processed_names)} Worker(s) Blacklisted & Excluded",
                 description=(
-                    f"**`{clean_name}`** has been added to the ECODA exclusion list.\n\n"
-                    f"• They will **NO LONGER appear** on any live or historical leaderboards.\n"
-                    f"• Future sheet uploads containing their name will be automatically skipped.\n"
-                    + (f"• **`{deleted_count}`** existing records deleted from database." if delete_records else "• Existing database records retained (hidden from view).")
+                    "The specified workers have been added to the ECODA exclusion list.\n\n"
+                    "• They will **NO LONGER appear** on any live or historical leaderboards.\n"
+                    "• Future sheet uploads containing their names will be automatically skipped.\n"
+                    + (f"• **`{total_deleted}`** existing records deleted from database." if delete_records else "• Existing database records retained (hidden from view).")
                 ),
                 color=discord.Color.red(),
             )
             embed.add_field(name="👤 Blacklisted By", value=f"<@{interaction.user.id}>", inline=True)
+            preview_names = ", ".join(f"`{n}`" for n in processed_names[:15])
+            if len(processed_names) > 15:
+                preview_names += f" ...and {len(processed_names) - 15} more"
+            embed.add_field(name="👥 Excluded Workers", value=preview_names, inline=False)
             embed.set_footer(text="Live dynamic leaderboards have been automatically refreshed.")
             await interaction.followup.send(embed=embed)
 
         elif action == "remove":
-            clean_name = worker.strip()
-            removed = await remove_ecoda_excluded_worker(clean_name)
+            raw_workers = [w.strip() for w in workers.split(",") if w.strip()]
+            removed_names = []
+            not_found = []
+
+            for w in raw_workers:
+                clean_name = w
+                digits = re.findall(r"\d+", clean_name)
+                if digits and len(digits[0]) >= 15 and interaction.guild:
+                    m = interaction.guild.get_member(int(digits[0]))
+                    if m:
+                        clean_name = m.display_name
+
+                if await remove_ecoda_excluded_worker(clean_name):
+                    removed_names.append(clean_name)
+                else:
+                    not_found.append(clean_name)
+
             await update_live_leaderboard_messages(self.bot)
 
-            if removed:
-                embed = discord.Embed(
-                    title="✅ Worker Removed from Blacklist",
-                    description=f"**`{clean_name}`** has been removed from the exclusion list and can now appear on leaderboards.",
-                    color=discord.Color.green(),
+            embed = discord.Embed(
+                title="✅ Worker(s) Removed from Blacklist",
+                color=discord.Color.green(),
+            )
+            if removed_names:
+                embed.add_field(
+                    name=f"🟢 Removed ({len(removed_names)})",
+                    value=", ".join(f"`{n}`" for n in removed_names),
+                    inline=False,
                 )
-            else:
-                embed = discord.Embed(
-                    title="⚠️ Not Found in Blacklist",
-                    description=f"**`{clean_name}`** was not found in the exclusion list.",
-                    color=discord.Color.orange(),
+            if not_found:
+                embed.add_field(
+                    name=f"⚠️ Not Found in Blacklist ({len(not_found)})",
+                    value=", ".join(f"`{n}`" for n in not_found),
+                    inline=False,
                 )
+            embed.set_footer(text="Live dynamic leaderboards have been automatically refreshed.")
             await interaction.followup.send(embed=embed)
 
         elif action == "list":
