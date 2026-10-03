@@ -1261,6 +1261,15 @@ async def delete_ecoda_by_date(record_date: str) -> int:
         return cursor.rowcount
 
 
+async def reset_ecoda_records() -> int:
+    """Deletes all records from ecoda_records table. Preserves voice_activity and settings."""
+    async with aiosqlite.connect(DB_FILE) as db:
+        cursor = await db.execute("DELETE FROM ecoda_records")
+        await db.commit()
+        return cursor.rowcount
+
+
+
 # ==========================================
 # LIVE LEADERBOARD IN-MEMORY STATE & VIEWS
 # ==========================================

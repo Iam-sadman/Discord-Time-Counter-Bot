@@ -39,6 +39,7 @@ from utils import (
     parse_custom_date,
     parse_ecoda_file,
     remove_ecoda_excluded_worker,
+    reset_ecoda_records,
     resolve_member_display,
     save_ecoda_records,
     set_setting,
@@ -488,6 +489,36 @@ class EcodaDeletePromptView(discord.ui.View):
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(content="❌ Deletion cancelled.", embed=None, view=None)
+
+
+# ==========================================
+# INTERACTIVE RESET CONFIRM VIEW
+# ==========================================
+class EcodaResetConfirmView(discord.ui.View):
+    """Confirmation view for wiping all ECODA records."""
+
+    def __init__(self, author_id: int, on_confirm):
+        super().__init__(timeout=60)
+        self.author_id = author_id
+        self.on_confirm = on_confirm
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ This confirmation is not for you.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="⚠️ Yes, Reset All ECODA Data", style=discord.ButtonStyle.danger, row=0)
+    async def btn_confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await self.on_confirm(interaction)
+
+    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="❌ ECODA reset cancelled. No data was deleted.", embed=None, view=None)
 
 
 # ==========================================
@@ -1221,6 +1252,60 @@ class EcodaCog(commands.Cog):
                 )
                 embed.set_footer(text="Use /ecoda_exclude action:Remove to restore any worker.")
             await interaction.followup.send(embed=embed)
+
+    # ------------------------------------------
+    # SLASH COMMAND: /ecoda_reset
+    # ------------------------------------------
+    @app_commands.command(
+        name="ecoda_reset",
+        description="Reset/wipe ALL ECODA work hours while keeping Discord Voice tracking safe [Admin/Leader only].",
+    )
+    async def ecoda_reset(self, interaction: discord.Interaction):
+        if not await is_ecoda_checker(interaction.user):
+            await interaction.response.send_message(
+                "❌ **Access Denied:** Only Administrators or authorized Team Leaders/Checkers can reset ECODA data.",
+                ephemeral=True,
+            )
+            return
+
+        embed = discord.Embed(
+            title="⚠️ Confirm ECODA Data Reset",
+            description=(
+                "Are you sure you want to reset all **ECODA Workforce Data**?\n\n"
+                "• **Will be deleted**: All uploaded daily work hours & manual entries (`ecoda_records`).\n"
+                "• **100% PRESERVED**: Discord Voice Activity tracking, bot configurations, and blacklist.\n"
+                "• **Leaderboard**: Live ECODA leaderboard will immediately reset to clean state.\n\n"
+                "⚠️ *This action is irreversible. Click the button below to confirm.*"
+            ),
+            color=discord.Color.red(),
+        )
+
+        async def do_reset(i: discord.Interaction):
+            if not i.response.is_done():
+                await i.response.defer()
+
+            deleted_count = await reset_ecoda_records()
+            await update_live_leaderboard_messages(self.bot)
+
+            success_embed = discord.Embed(
+                title="🔄 ECODA Dashboard Reset Complete",
+                description=(
+                    f"✅ Successfully wiped all **`{deleted_count}`** ECODA work records from the database.\n\n"
+                    f"• **Discord Voice Tracking:** 100% Intact & Untouched\n"
+                    f"• **Live ECODA Dashboard:** Refreshed and ready for fresh uploads\n"
+                    f"• **Reset By:** <@{i.user.id}>"
+                ),
+                color=discord.Color.green(),
+            )
+            success_embed.set_footer(text="You can now start uploading fresh sheets via /ecoda_upload.")
+
+            if i.response.is_done():
+                await i.edit_original_response(content="", embed=success_embed, view=None)
+            else:
+                await i.followup.send(embed=success_embed)
+
+        view = EcodaResetConfirmView(author_id=interaction.user.id, on_confirm=do_reset)
+        await interaction.response.send_message(embed=embed, view=view)
 
     # ------------------------------------------
     # SLASH COMMAND: /ecoda_set_role
