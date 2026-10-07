@@ -186,14 +186,14 @@ Workforce productivity is calculated across two official monthly cutoffs:
 > Handles sheet ingestion, manual hour adjustments, deletions, external worker exclusions, role/channel configuration, and the ECODA reset system.
 
 #### 1. `/ecoda_upload`
-* **Purpose:** Uploads a daily ECODA work hours sheet (`.csv` or `.xlsx`). The bot parses worker rows, matches Discord accounts, saves hours, and automatically refreshes the live leaderboards.
+* **Purpose:** Uploads a daily ECODA work hours sheet (`.csv` or `.xlsx`). The bot parses worker rows, matches Discord accounts, saves hours, and automatically refreshes all live leaderboards and status boards.
 * **Access Level:** Team Leader / Checker Role or Server Administrator.
 * **Channel Restriction:** If locked via `/ecoda_set_channel`, can only be run in that designated channel.
 * **Parameters:**
   * `file` *(Required, Attachment)*: The `.csv` or `.xlsx` spreadsheet.
-  * `team` *(Optional, String)*: Team name for this upload (e.g. `Titans`, `Alpha`).
+  * `team` *(Optional, Autocomplete Dropdown)*: Select from registered teams (e.g. `Delta Force`, `Nano Banana`, `Night Owls`, etc.) with instant searchable autocomplete.
   * `date` *(Optional, String)*: Record date in `YYYY-MM-DD` format (defaults to today).
-* **Example:** `/ecoda_upload file:data_oct02.xlsx team:Titans`
+* **Example:** `/ecoda_upload file:data_oct02.xlsx team:Delta Force`
 
 #### 2. `/ecoda_add`
 * **Purpose:** Manually logs or adds missed work hours for a worker without needing to re-upload the entire sheet.
@@ -278,16 +278,38 @@ Workforce productivity is calculated across two official monthly cutoffs:
 * **Parameters:** *None.*
 * **Example:** `/ecoda_settings`
 
+#### 12. `/ecoda_team` (Command Group)
+* **Purpose:** Manages the server's registered team roster used for `/ecoda_upload` autocompletes and daily upload status tracking.
+* **Access Level:** Server Administrator only.
+* **Subcommands:**
+  * `/ecoda_team add name:<str>` — Adds a new team to the active roster.
+  * `/ecoda_team remove name:<str>` — Removes a team from the active roster (features autocomplete).
+  * `/ecoda_team list` — Displays all registered teams, active status, worker counts, and last activity date.
+* **Example:** `/ecoda_team add name:Titans`
+
+#### 13. `/ecoda_team_status`
+* **Purpose:** Displays an interactive daily team file upload status dashboard showing which teams have uploaded their sheets and which teams are pending.
+* **Access Level:** Team Leader / Checker Role or Server Administrator.
+* **Features:**
+  * Progress bar with percentage and summary (`✅ 6 Uploaded • ❌ 4 Pending`).
+  * 🟢 Uploaded team details (uploader tag, upload time, total workers, work hours).
+  * 🔴 Pending team alerts.
+  * Interactive navigation buttons: `[ ◀️ Prev Day ]`, `[ 📅 Date Indicator ]`, `[ Next Day ▶️ ]`, `[ 📅 Today ]`, `[ 🔄 Refresh ]`.
+* **Parameters:**
+  * `date` *(Optional, String)*: Target date in `YYYY-MM-DD` format (defaults to today).
+* **Example:** `/ecoda_team_status` or `/ecoda_team_status date:2026-10-02`
+
 ---
 
 ### 📦 Cog 2: `LeaderboardCog` (`cogs/leaderboard.py`)
 > Handles server-wide voice leaderboards, cutoff history exploration, and deployment of the permanent live dynamic leaderboards channel.
 
-#### 12. `/setup_live_leaderboard`
-* **Purpose:** Deploys two permanent, self-updating live leaderboard embeds into a designated channel:
+#### 14. `/setup_live_leaderboard`
+* **Purpose:** Deploys three permanent, self-updating live embeds into a designated channel:
   1. **🏆 Live Voice Activity Leaderboard**
   2. **💼 Live ECODA Activity Leaderboard**
-  Both embeds feature persistent interactive buttons (cutoffs, role toggles, active/inactive filters, pagination, and refresh) that survive bot restarts.
+  3. **📊 Live ECODA Team Upload Status Board**
+  All three embeds feature persistent interactive buttons (cutoffs, role toggles, active/inactive filters, day navigation, and refresh) that survive bot restarts.
 * **Access Level:** Server Administrator only.
 * **Parameters:**
   * `channel` *(Required, Text Channel)*: Target channel (e.g. `#leaderboard`).

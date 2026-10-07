@@ -19,8 +19,10 @@ from utils import (
     STATS_CHANNEL_ID,
     build_live_ecoda_leaderboard_embed,
     build_live_voice_leaderboard_embed,
+    build_team_upload_status_embed,
     fetch_ecoda_leaderboard_data,
     fetch_leaderboard_data,
+    fetch_team_upload_status,
     format_duration,
     format_hours,
     get_cutoff_dates,
@@ -33,6 +35,7 @@ from utils import (
     update_live_leaderboard_messages,
     LiveVoiceLeaderboardView,
     LiveEcodaLeaderboardView,
+    LiveTeamUploadStatusView,
 )
 
 PAGE_SIZE = 10
@@ -456,27 +459,37 @@ class LeaderboardCog(commands.Cog):
             )
             ecoda_msg = await channel.send(embed=ecoda_embed, view=ecoda_view)
 
-            # 3. Save IDs in database settings
+            # 3. Post Initial ECODA Team Upload Status message with interactive view
+            today_date = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
+            status_data = await fetch_team_upload_status(today_date)
+            status_embed = build_team_upload_status_embed(channel.guild, status_data, today_date)
+            status_view = LiveTeamUploadStatusView(record_date=today_date)
+            status_msg = await channel.send(embed=status_embed, view=status_view)
+
+            # 4. Save IDs in database settings
             await set_setting("live_leaderboard_channel_id", str(channel.id))
             await set_setting("live_voice_msg_id", str(voice_msg.id))
             await set_setting("live_ecoda_msg_id", str(ecoda_msg.id))
+            await set_setting("live_status_msg_id", str(status_msg.id))
 
-            # 4. Try pinning messages if permitted
+            # 5. Try pinning messages if permitted
             if perms.manage_messages:
                 try:
                     await voice_msg.pin(reason="Live Dynamic Voice Leaderboard")
                     await ecoda_msg.pin(reason="Live Dynamic ECODA Leaderboard")
+                    await status_msg.pin(reason="Live ECODA Team Upload Status Board")
                 except Exception:
                     pass
 
             embed = discord.Embed(
-                title="✅ Dynamic Cutoff Live Leaderboards Deployed!",
+                title="✅ Dynamic Live Leaderboards & Status Board Deployed!",
                 description=(
-                    f"Both **Voice Leaderboard** and **ECODA Leaderboard** are now live in <#{channel.id}>!\n\n"
+                    f"**Voice Leaderboard**, **ECODA Leaderboard**, and **Team Upload Status Board** are now live in <#{channel.id}>!\n\n"
                     f"📌 **Key Functionalities Active:**\n"
                     f"• **Cutoff Tracking:** Tracking `{cutoff_label}`. Automatically resets when each cutoff ends.\n"
                     f"• **Interactive Pagination:** Users can click `◀️ Prev` and `Next ▶️` directly on the messages.\n"
                     f"• **Cutoff Toggle:** Users can click `[ ⏳ Current Cutoff ]` and `[ ⏪ Previous Cutoff ]` to switch periods.\n"
+                    f"• **Team Upload Status:** Live tracking of daily team uploads (🟢 Uploaded vs 🔴 Pending) with Prev/Today/Next/Refresh buttons.\n"
                     f"• **History Check:** Anyone can use `/cutoff_history` to check any past cutoff record!\n\n"
                     f"🔒 **Channel Permissions Tip for <#{channel.id}>:**\n"
                     f"Channel Settings ➔ Permissions ➔ `@everyone`:\n"

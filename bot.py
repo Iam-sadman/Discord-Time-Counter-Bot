@@ -32,6 +32,7 @@ from utils import (
     init_db,
     LiveVoiceLeaderboardView,
     LiveEcodaLeaderboardView,
+    LiveTeamUploadStatusView,
 )
 
 # ==========================================
@@ -62,6 +63,7 @@ class VoiceBot(commands.Bot):
         # Register persistent views for live leaderboards
         self.add_view(LiveVoiceLeaderboardView())
         self.add_view(LiveEcodaLeaderboardView())
+        self.add_view(LiveTeamUploadStatusView())
 
         for cog in COGS:
             await self.load_extension(cog)

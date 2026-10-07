@@ -28,24 +28,31 @@ from utils import (
     LOCAL_TZ,
     add_ecoda_excluded_worker,
     add_ecoda_manual_record,
+    add_team,
+    build_team_upload_status_embed,
     delete_ecoda_by_date,
     delete_ecoda_record,
+    fetch_ecoda_leaderboard_data,
+    fetch_team_upload_status,
     find_member_by_name,
     format_hours,
+    get_all_teams,
     get_date_range,
     get_ecoda_excluded_workers,
     get_setting,
+    get_team_details_list,
     is_ecoda_checker,
     parse_custom_date,
     parse_ecoda_file,
     remove_ecoda_excluded_worker,
+    remove_team,
     reset_ecoda_records,
     resolve_member_display,
     save_ecoda_records,
     set_setting,
     update_ecoda_work_time,
     update_live_leaderboard_messages,
-    fetch_ecoda_leaderboard_data,
+    OnDemandTeamUploadStatusView,
 )
 
 PAGE_SIZE = 10
@@ -670,6 +677,25 @@ class EcodaCog(commands.Cog):
         embed.set_footer(text=f"File: {file.filename} • Re-uploading on the same date will update existing records.")
         await interaction.followup.send(embed=embed)
 
+    async def _team_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        """Shared autocomplete callback for registered ECODA team names."""
+        teams = await get_all_teams()
+        current_clean = current.strip().lower()
+        matches = [t for t in teams if current_clean in t.lower()] if current_clean else teams
+        return [app_commands.Choice(name=t, value=t) for t in matches[:25]]
+
+    @ecoda_upload.autocomplete("team")
+    async def ecoda_upload_team_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        return await self._team_autocomplete(interaction, current)
+
     # ------------------------------------------
     # HELPER EXECUTION METHODS
     # ------------------------------------------
@@ -914,6 +940,14 @@ class EcodaCog(commands.Cog):
             view = CalendarDatePickerView(author_id=interaction.user.id, on_date_selected=on_picked)
             await interaction.response.send_message(embed=prompt_embed, view=view)
 
+    @ecoda_add.autocomplete("team")
+    async def ecoda_add_team_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        return await self._team_autocomplete(interaction, current)
+
     # ------------------------------------------
     # SLASH COMMAND: /ecoda_edit
     # ------------------------------------------
@@ -970,6 +1004,14 @@ class EcodaCog(commands.Cog):
 
             view = CalendarDatePickerView(author_id=interaction.user.id, on_date_selected=on_picked)
             await interaction.response.send_message(embed=prompt_embed, view=view)
+
+    @ecoda_edit.autocomplete("team")
+    async def ecoda_edit_team_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        return await self._team_autocomplete(interaction, current)
 
     # ------------------------------------------
     # SLASH COMMAND: /ecoda_delete
@@ -1407,6 +1449,139 @@ class EcodaCog(commands.Cog):
         rf = None if role_filter == "all" else int(role_filter)
         view = EcodaLeaderboardView(timeframe=timeframe, role_filter=rf, status_filter=status, page=1)
         await render_ecoda_leaderboard(interaction, view)
+
+    # ------------------------------------------
+    # SLASH COMMAND GROUP: /ecoda_team [Admin Only]
+    # ------------------------------------------
+    ecoda_team = app_commands.Group(
+        name="ecoda_team",
+        description="Manage registered ECODA teams for upload dropdown and status tracking [Admin only].",
+        default_permissions=discord.Permissions(administrator=True),
+    )
+
+    @ecoda_team.command(name="add", description="Add a new team to the registered roster [Admin only].")
+    @app_commands.describe(name="Name of the team to add (e.g. Delta Force, Titans)")
+    async def team_add(self, interaction: discord.Interaction, name: str):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "❌ **Access Denied:** Only **Server Administrators** can manage ECODA teams.",
+                ephemeral=True,
+            )
+            return
+
+        ok, msg = await add_team(name)
+        color = discord.Color.green() if ok else discord.Color.red()
+        embed = discord.Embed(title="🛡️ ECODA Team Management", description=msg, color=color)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        if ok:
+            await update_live_leaderboard_messages(self.bot)
+
+    @ecoda_team.command(name="remove", description="Remove a team from the active roster [Admin only].")
+    @app_commands.describe(name="Name of the team to remove")
+    async def team_remove(self, interaction: discord.Interaction, name: str):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "❌ **Access Denied:** Only **Server Administrators** can manage ECODA teams.",
+                ephemeral=True,
+            )
+            return
+
+        ok, msg = await remove_team(name)
+        color = discord.Color.green() if ok else discord.Color.red()
+        embed = discord.Embed(title="🛡️ ECODA Team Management", description=msg, color=color)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        if ok:
+            await update_live_leaderboard_messages(self.bot)
+
+    @team_remove.autocomplete("name")
+    async def team_remove_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        return await self._team_autocomplete(interaction, current)
+
+    @ecoda_team.command(name="list", description="List all registered teams with activity statistics [Admin only].")
+    async def team_list(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "❌ **Access Denied:** Only **Server Administrators** can view the team roster.",
+                ephemeral=True,
+            )
+            return
+
+        teams_data = await get_team_details_list()
+        if not teams_data:
+            await interaction.response.send_message(
+                "ℹ️ No registered teams found in the database.",
+                ephemeral=True,
+            )
+            return
+
+        active_count = sum(1 for t in teams_data if t["is_active"])
+        embed = discord.Embed(
+            title="🛡️ Registered ECODA Teams Roster",
+            description=(
+                f"**Active Teams:** `{active_count}` • **Total Registered:** `{len(teams_data)}`\n"
+                "These teams appear automatically in the `/ecoda_upload` dropdown.\n"
+            ),
+            color=discord.Color.blue(),
+        )
+
+        lines = []
+        for idx, t in enumerate(teams_data, 1):
+            status_icon = "🟢" if t["is_active"] else "⚪ *(Inactive)*"
+            workers = t["worker_count"]
+            last_date = f"`{t['last_record_date']}`" if t["last_record_date"] else "*No uploads yet*"
+            lines.append(f"`#{idx:02d}` {status_icon} **{t['name']}** — {workers} workers • Last upload: {last_date}")
+
+        chunk = "\n".join(lines)
+        if len(chunk) > 3900:
+            chunk = chunk[:3890] + "..."
+        embed.description += "\n" + chunk
+        embed.set_footer(text="Use /ecoda_team add or /ecoda_team remove to manage teams.")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ------------------------------------------
+    # SLASH COMMAND: /ecoda_team_status [Checker / Admin]
+    # ------------------------------------------
+    @app_commands.command(
+        name="ecoda_team_status",
+        description="View daily ECODA file upload status for all teams [Checker / Admin only].",
+    )
+    @app_commands.describe(
+        date="Record date in YYYY-MM-DD format (defaults to today)",
+    )
+    async def ecoda_team_status(
+        self,
+        interaction: discord.Interaction,
+        date: str | None = None,
+    ):
+        if not await is_ecoda_checker(interaction.user):
+            await interaction.response.send_message(
+                "❌ **Access Denied:** Only members with the **Checker / Team Leader** role or Server Administrators can view team upload status.",
+                ephemeral=True,
+            )
+            return
+
+        now_local = datetime.now(LOCAL_TZ)
+        if date:
+            parsed = parse_custom_date(date)
+            if not parsed:
+                await interaction.response.send_message(
+                    "❌ Invalid date format! Please use `YYYY-MM-DD` (e.g. `2026-10-02`).",
+                    ephemeral=True,
+                )
+                return
+            target_date = parsed
+        else:
+            target_date = now_local.strftime("%Y-%m-%d")
+
+        await interaction.response.defer(ephemeral=False)
+        status_data = await fetch_team_upload_status(target_date)
+        embed = build_team_upload_status_embed(interaction.guild, status_data, target_date)
+        view = OnDemandTeamUploadStatusView(record_date=target_date)
+        await interaction.followup.send(embed=embed, view=view)
 
 
 # ==========================================

@@ -339,6 +339,36 @@ async def init_db():
             )
         """)
 
+        # ECODA registered teams table
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS ecoda_teams (
+                name TEXT PRIMARY KEY COLLATE NOCASE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_active INTEGER DEFAULT 1
+            )
+        """)
+        # Seed initial 10 teams if table is empty
+        cursor = await db.execute("SELECT COUNT(*) FROM ecoda_teams")
+        team_count = (await cursor.fetchone())[0]
+        if team_count == 0:
+            default_teams = [
+                "Delta Force",
+                "Nano Banana",
+                "Golden Tshushima",
+                "Rafael's Cartel [1989]",
+                "Night Owls",
+                "Totoro",
+                "Athena",
+                "Flash Point",
+                "Rising Horizon",
+                "Pixel Hunter",
+            ]
+            for team_name in default_teams:
+                await db.execute(
+                    "INSERT OR IGNORE INTO ecoda_teams (name, is_active) VALUES (?, 1)",
+                    (team_name,),
+                )
+
         # Settings table for dynamic configurations
         await db.execute("""
             CREATE TABLE IF NOT EXISTS bot_settings (
@@ -1160,6 +1190,172 @@ async def get_ecoda_excluded_workers() -> list[dict]:
         return [dict(r) for r in rows]
 
 
+# ==========================================
+# ECODA TEAM MANAGEMENT
+# ==========================================
+async def get_all_teams() -> list[str]:
+    """Returns a list of all active registered team names sorted alphabetically."""
+    async with aiosqlite.connect(DB_FILE) as db:
+        cursor = await db.execute(
+            "SELECT name FROM ecoda_teams WHERE is_active = 1 ORDER BY name COLLATE NOCASE ASC"
+        )
+        rows = await cursor.fetchall()
+        return [row[0] for row in rows]
+
+
+async def add_team(name: str) -> tuple[bool, str]:
+    """Adds a new team to ecoda_teams. Returns (success, message)."""
+    clean_name = name.strip()
+    if not clean_name:
+        return False, "❌ Team name cannot be empty."
+    if len(clean_name) > 50:
+        return False, "❌ Team name must be 50 characters or less."
+
+    async with aiosqlite.connect(DB_FILE) as db:
+        cursor = await db.execute(
+            "SELECT is_active FROM ecoda_teams WHERE LOWER(name) = LOWER(?)",
+            (clean_name,),
+        )
+        row = await cursor.fetchone()
+        if row:
+            if row[0] == 1:
+                return False, f"⚠️ Team **`{clean_name}`** already exists in the team roster!"
+            else:
+                await db.execute(
+                    "UPDATE ecoda_teams SET is_active = 1 WHERE LOWER(name) = LOWER(?)",
+                    (clean_name,),
+                )
+                await db.commit()
+                return True, f"✅ Team **`{clean_name}`** has been reactivated successfully!"
+
+        await db.execute(
+            "INSERT INTO ecoda_teams (name, is_active) VALUES (?, 1)",
+            (clean_name,),
+        )
+        await db.commit()
+        return True, f"✅ Team **`{clean_name}`** has been added to the team roster!"
+
+
+async def remove_team(name: str) -> tuple[bool, str]:
+    """Marks a team as inactive. Returns (success, message)."""
+    clean_name = name.strip()
+    if not clean_name:
+        return False, "❌ Team name cannot be empty."
+
+    async with aiosqlite.connect(DB_FILE) as db:
+        cursor = await db.execute(
+            "SELECT name FROM ecoda_teams WHERE LOWER(name) = LOWER(?) AND is_active = 1",
+            (clean_name,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return False, f"⚠️ Team **`{clean_name}`** was not found in active teams."
+
+        actual_name = row[0]
+        await db.execute(
+            "UPDATE ecoda_teams SET is_active = 0 WHERE LOWER(name) = LOWER(?)",
+            (clean_name,),
+        )
+        await db.commit()
+        return True, f"✅ Team **`{actual_name}`** has been removed from active teams."
+
+
+async def get_team_details_list() -> list[dict]:
+    """Returns all registered teams with record stats."""
+    async with aiosqlite.connect(DB_FILE) as db:
+        cursor = await db.execute("""
+            SELECT 
+                t.name,
+                t.is_active,
+                t.created_at,
+                COUNT(DISTINCT r.ecoda_name) as worker_count,
+                MAX(r.record_date) as last_record_date
+            FROM ecoda_teams t
+            LEFT JOIN ecoda_records r ON LOWER(TRIM(t.name)) = LOWER(TRIM(r.team_name))
+            GROUP BY t.name
+            ORDER BY t.is_active DESC, t.name COLLATE NOCASE ASC
+        """)
+        rows = await cursor.fetchall()
+        return [
+            {
+                "name": row[0],
+                "is_active": bool(row[1]),
+                "created_at": row[2],
+                "worker_count": row[3] or 0,
+                "last_record_date": row[4],
+            }
+            for row in rows
+        ]
+
+
+async def fetch_team_upload_status(record_date: str) -> dict:
+    """
+    Fetches upload status for all registered teams for a specific date.
+    Returns summary stats and breakdown of uploaded vs pending teams.
+    """
+    async with aiosqlite.connect(DB_FILE) as db:
+        cursor = await db.execute(
+            "SELECT name FROM ecoda_teams WHERE is_active = 1 ORDER BY name COLLATE NOCASE ASC"
+        )
+        all_teams = [row[0] for row in await cursor.fetchall()]
+
+        cursor = await db.execute("""
+            SELECT 
+                TRIM(team_name) as t_name,
+                COUNT(*) as worker_count,
+                SUM(work_time) as total_hours,
+                MAX(upload_timestamp) as last_upload,
+                MAX(uploaded_by) as uploaded_by
+            FROM ecoda_records
+            WHERE record_date = ? 
+              AND team_name IS NOT NULL 
+              AND TRIM(team_name) != ''
+            GROUP BY LOWER(TRIM(team_name))
+        """, (record_date,))
+        rows = await cursor.fetchall()
+
+    upload_map = {}
+    for row in rows:
+        t_name = row[0]
+        upload_map[t_name.lower()] = {
+            "team_name": t_name,
+            "worker_count": row[1],
+            "total_hours": row[2] or 0.0,
+            "last_upload": row[3],
+            "uploaded_by": row[4],
+        }
+
+    uploaded = []
+    pending = []
+
+    for t in all_teams:
+        t_lower = t.lower()
+        if t_lower in upload_map:
+            info = upload_map.pop(t_lower)
+            info["team_name"] = t
+            uploaded.append(info)
+        else:
+            pending.append(t)
+
+    for remaining in upload_map.values():
+        uploaded.append(remaining)
+
+    total_teams = len(uploaded) + len(pending)
+    uploaded_count = len(uploaded)
+    pending_count = len(pending)
+    percentage = int(round((uploaded_count / total_teams) * 100)) if total_teams > 0 else 0
+
+    return {
+        "record_date": record_date,
+        "total_teams": total_teams,
+        "uploaded_count": uploaded_count,
+        "pending_count": pending_count,
+        "percentage": percentage,
+        "uploaded": uploaded,
+        "pending": pending,
+    }
+
+
 async def add_ecoda_manual_record(
     worker_name: str,
     hours: float,
@@ -1280,6 +1476,7 @@ live_board_state = {
     "ecoda_cutoff": "current",
     "ecoda_role": 0,           # 0: Labelers, 1: Checkers, None: All Roles
     "ecoda_status": "active",  # 'active' (work_time > 0) or 'inactive' (work_time == 0)
+    "status_date": datetime.now(LOCAL_TZ).strftime("%Y-%m-%d"),
 }
 
 
@@ -1676,8 +1873,266 @@ async def update_live_ecoda_leaderboard(bot: commands.Bot):
         print(f"Notice: Failed to update live ecoda message: {e}")
 
 
+def build_team_upload_status_embed(
+    guild: discord.Guild | None,
+    status_data: dict,
+    record_date: str,
+) -> discord.Embed:
+    """Builds the rich embed for ECODA Daily Team Upload Status."""
+    total_teams = status_data["total_teams"]
+    uploaded_count = status_data["uploaded_count"]
+    pending_count = status_data["pending_count"]
+    percentage = status_data["percentage"]
+    uploaded = status_data["uploaded"]
+    pending = status_data["pending"]
+
+    today_str = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
+    try:
+        dt_obj = datetime.strptime(record_date, "%Y-%m-%d")
+        formatted_date = dt_obj.strftime("%A, %B %d, %Y")
+    except Exception:
+        formatted_date = record_date
+
+    if record_date == today_str:
+        date_badge = "✨ **Today**"
+    elif record_date < today_str:
+        date_badge = "⏳ **Past Date**"
+    else:
+        date_badge = "🔮 **Future Date**"
+
+    filled = int(round((percentage / 100) * 10))
+    bar = "🟩" * filled + "⬜" * (10 - filled)
+
+    if pending_count == 0 and total_teams > 0:
+        color = discord.Color.green()
+    elif uploaded_count > 0:
+        color = discord.Color.gold()
+    else:
+        color = discord.Color.red()
+
+    embed = discord.Embed(
+        title="📊 ECODA Daily Team Upload Status",
+        color=color,
+    )
+
+    desc_lines = [
+        f"📅 **Date:** `{record_date}` ({date_badge}) — *{formatted_date}*",
+        f"**Progress:** {bar} **{percentage}%**",
+        f"**Overview:** ✅ **`{uploaded_count}`** Uploaded • ❌ **`{pending_count}`** Pending • Total: **`{total_teams}`** Teams\n",
+    ]
+    embed.description = "\n".join(desc_lines)
+
+    if uploaded:
+        up_lines = []
+        for u in uploaded:
+            t_name = u["team_name"]
+            w_count = u["worker_count"]
+            h_str = format_hours(u["total_hours"])
+            u_by = f"<@{u['uploaded_by']}>" if u.get("uploaded_by") else "*Sheet Upload*"
+
+            raw_ts = u.get("last_upload")
+            time_part = ""
+            if raw_ts:
+                try:
+                    ts_dt = datetime.fromisoformat(str(raw_ts).replace("Z", ""))
+                    time_part = f" • 🕒 `{ts_dt.strftime('%I:%M %p')}`"
+                except Exception:
+                    pass
+
+            up_lines.append(f"🟢 **{t_name}**\n  └ {u_by} • ⏱️ `{h_str}` ({w_count} workers){time_part}")
+
+        chunk = "\n".join(up_lines)
+        if len(chunk) > 1024:
+            chunk = chunk[:1020] + "..."
+        embed.add_field(name=f"✅ Uploaded Teams ({uploaded_count})", value=chunk, inline=False)
+    else:
+        embed.add_field(
+            name=f"✅ Uploaded Teams ({uploaded_count})",
+            value="*No team sheets uploaded yet for this date.*",
+            inline=False,
+        )
+
+    if pending:
+        pend_lines = [f"🔴 **{t}** — ⚠️ *Awaiting sheet upload*" for t in pending]
+        chunk = "\n".join(pend_lines)
+        if len(chunk) > 1024:
+            chunk = chunk[:1020] + "..."
+        embed.add_field(name=f"❌ Pending Teams ({pending_count})", value=chunk, inline=False)
+    else:
+        embed.add_field(
+            name=f"❌ Pending Teams (0)",
+            value="🎉 *All registered teams have uploaded their sheets for this date!*",
+            inline=False,
+        )
+
+    embed.set_footer(text="ECODA Operational Tracker • Auto-refreshes on upload")
+    embed.timestamp = datetime.now(LOCAL_TZ)
+    return embed
+
+
+class LiveTeamUploadStatusView(discord.ui.View):
+    def __init__(self, record_date: str | None = None):
+        super().__init__(timeout=None)
+        date_to_use = record_date or live_board_state.get("status_date") or datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
+        self.update_buttons(date_to_use)
+
+    def update_buttons(self, current_date: str):
+        today = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
+        self.btn_today.style = discord.ButtonStyle.primary if current_date == today else discord.ButtonStyle.secondary
+        self.btn_indicator.label = f"📅 {current_date}"
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not await is_ecoda_checker(interaction.user):
+            await interaction.response.send_message(
+                "❌ **Access Denied:** Only members with the **Checker / Team Leader** role or Server Administrators can use these controls.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="◀️ Prev Day", style=discord.ButtonStyle.secondary, custom_id="live_team_status:prev", row=0)
+    async def btn_prev(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cur_date_str = live_board_state.get("status_date") or datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
+        try:
+            dt = datetime.strptime(cur_date_str, "%Y-%m-%d") - timedelta(days=1)
+            live_board_state["status_date"] = dt.strftime("%Y-%m-%d")
+        except Exception:
+            live_board_state["status_date"] = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
+        await interaction.response.defer()
+        await update_live_team_status_board(interaction.client)
+
+    @discord.ui.button(label="📅 Date", style=discord.ButtonStyle.secondary, disabled=True, custom_id="live_team_status:indicator", row=0)
+    async def btn_indicator(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pass
+
+    @discord.ui.button(label="Next Day ▶️", style=discord.ButtonStyle.secondary, custom_id="live_team_status:next", row=0)
+    async def btn_next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cur_date_str = live_board_state.get("status_date") or datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
+        try:
+            dt = datetime.strptime(cur_date_str, "%Y-%m-%d") + timedelta(days=1)
+            live_board_state["status_date"] = dt.strftime("%Y-%m-%d")
+        except Exception:
+            live_board_state["status_date"] = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
+        await interaction.response.defer()
+        await update_live_team_status_board(interaction.client)
+
+    @discord.ui.button(label="📅 Today", style=discord.ButtonStyle.primary, custom_id="live_team_status:today", row=1)
+    async def btn_today(self, interaction: discord.Interaction, button: discord.ui.Button):
+        live_board_state["status_date"] = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
+        await interaction.response.defer()
+        await update_live_team_status_board(interaction.client)
+
+    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.success, custom_id="live_team_status:refresh", row=1)
+    async def btn_refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        await update_live_team_status_board(interaction.client)
+
+
+class OnDemandTeamUploadStatusView(discord.ui.View):
+    def __init__(self, record_date: str):
+        super().__init__(timeout=180)
+        self.record_date = record_date
+        self.update_buttons()
+
+    def update_buttons(self):
+        today = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
+        self.btn_today.style = discord.ButtonStyle.primary if self.record_date == today else discord.ButtonStyle.secondary
+        self.btn_indicator.label = f"📅 {self.record_date}"
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not await is_ecoda_checker(interaction.user):
+            await interaction.response.send_message(
+                "❌ **Access Denied:** Only members with the **Checker / Team Leader** role or Server Administrators can use these controls.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _update_view_message(self, interaction: discord.Interaction):
+        self.update_buttons()
+        status_data = await fetch_team_upload_status(self.record_date)
+        embed = build_team_upload_status_embed(interaction.guild, status_data, self.record_date)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="◀️ Prev Day", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_prev(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            dt = datetime.strptime(self.record_date, "%Y-%m-%d") - timedelta(days=1)
+            self.record_date = dt.strftime("%Y-%m-%d")
+        except Exception:
+            self.record_date = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
+        await self._update_view_message(interaction)
+
+    @discord.ui.button(label="📅 Date", style=discord.ButtonStyle.secondary, disabled=True, row=0)
+    async def btn_indicator(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pass
+
+    @discord.ui.button(label="Next Day ▶️", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            dt = datetime.strptime(self.record_date, "%Y-%m-%d") + timedelta(days=1)
+            self.record_date = dt.strftime("%Y-%m-%d")
+        except Exception:
+            self.record_date = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
+        await self._update_view_message(interaction)
+
+    @discord.ui.button(label="📅 Today", style=discord.ButtonStyle.primary, row=1)
+    async def btn_today(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.record_date = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
+        await self._update_view_message(interaction)
+
+    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.success, row=1)
+    async def btn_refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._update_view_message(interaction)
+
+
+async def update_live_team_status_board(bot: commands.Bot):
+    """Updates the live team upload status message in the designated channel."""
+    channel_id_str = await get_setting("live_leaderboard_channel_id")
+    status_msg_id_str = await get_setting("live_status_msg_id")
+    if not channel_id_str or not channel_id_str.isdigit():
+        return
+
+    channel = bot.get_channel(int(channel_id_str))
+    if not channel:
+        try:
+            channel = await bot.fetch_channel(int(channel_id_str))
+        except Exception:
+            return
+
+    target_date = live_board_state.get("status_date") or datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
+    status_data = await fetch_team_upload_status(target_date)
+    embed = build_team_upload_status_embed(channel.guild, status_data, target_date)
+    view = LiveTeamUploadStatusView(record_date=target_date)
+
+    if status_msg_id_str and status_msg_id_str.isdigit():
+        try:
+            msg = await channel.fetch_message(int(status_msg_id_str))
+            await msg.edit(content="", embed=embed, view=view)
+            return
+        except discord.NotFound:
+            pass
+        except Exception as e:
+            print(f"Notice: Failed to update live team status message: {e}")
+            return
+
+    # Auto-deploy 3rd message if leaderboard channel is configured but status msg does not exist yet
+    try:
+        new_msg = await channel.send(embed=embed, view=view)
+        await set_setting("live_status_msg_id", str(new_msg.id))
+        perms = channel.permissions_for(channel.guild.me)
+        if perms.manage_messages:
+            try:
+                await new_msg.pin(reason="Live ECODA Team Upload Status Board")
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"Notice: Failed to deploy live team status message: {e}")
+
+
 async def update_live_leaderboard_messages(bot: commands.Bot):
-    """Refreshes both Voice and ECODA live leaderboards in the designated channel."""
+    """Refreshes Voice, ECODA, and Team Upload Status live boards in the designated channel."""
     await update_live_voice_leaderboard(bot)
     await update_live_ecoda_leaderboard(bot)
+    await update_live_team_status_board(bot)
 
